@@ -211,6 +211,10 @@ type Config struct {
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
 
+	// ComfyUI configures the optional dedicated ComfyUI listener port.
+	// A nil section means the listener is disabled.
+	ComfyUI *ComfyUIConfig `yaml:"comfyui"`
+
 	// tailcatEnabled records whether this process started a Tailcat listener.
 	// It is runtime state, not user configuration, so it must never appear in
 	// rendered configuration output.

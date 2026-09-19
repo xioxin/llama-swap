@@ -822,6 +822,21 @@
             "additionalProperties": false,
             "default": {}
         },
+        "comfyui": {
+            "type": "object",
+            "description": "Dedicated ComfyUI listener. When port is set, llama-swap opens a second HTTP listener that serves the comfyui_auto model at the path root, so ComfyUI clients that cannot address the /comfyui/ subdirectory (e.g. ComfyUI MCP servers and comfy-cli) can use http://host:port directly. Unlike the /comfyui/ endpoint, any request path on the dedicated listener may start an unloaded model; websocket handling still follows the model's compat.ignoreWebsockets setting.",
+            "properties": {
+                "port": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 65535,
+                    "default": 0,
+                    "description": "TCP port of the dedicated listener, bound on all interfaces. 0 (default) disables the listener. The port must not collide with the main -listen port or a port automatically allocated to a model via ${PORT}."
+                }
+            },
+            "additionalProperties": false,
+            "default": {}
+        },
         "routing": {
             "type": "object",
             "description": "Canonical routing/scheduling configuration. Alternative to the legacy top-level 'groups'/'matrix' keys; a config must not use both styles.",

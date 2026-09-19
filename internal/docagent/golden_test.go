@@ -170,7 +170,7 @@ func TestDocs_RealConfigExample_SectionKeys(t *testing.T) {
 		"metricsMaxInMemory", "captureBuffer", "ui", "performance", "startPort",
 		"sendLoadingState", "includeAliasesInList", "globalTTL", "unloadTimeout",
 		"globalConcurrencyLimit", "macros", "apiKeys", "tailcat", "upstream",
-		"profiles", "selectors", "models", "hooks", "routing", "peers",
+		"comfyui", "profiles", "selectors", "models", "hooks", "routing", "peers",
 	}
 
 	for _, key := range want {

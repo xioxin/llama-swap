@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -72,6 +73,31 @@ func configStorePath(cfg config.Config) string {
 		return ""
 	}
 	return strings.TrimSpace(cfg.Store.Path)
+}
+
+// comfyListenPort returns the dedicated ComfyUI listener port from the
+// configuration. A missing section or a zero port disables the listener and
+// returns 0. The port must not collide with the main -listen port.
+func comfyListenPort(cfg config.Config, listenAddr string) (int, error) {
+	port := 0
+	if cfg.ComfyUI != nil {
+		port = cfg.ComfyUI.Port
+	}
+	if port == 0 {
+		return 0, nil
+	}
+	_, mainPortStr, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return 0, fmt.Errorf("parse -listen address %q: %w", listenAddr, err)
+	}
+	mainPort, err := strconv.Atoi(mainPortStr)
+	if err != nil {
+		return 0, fmt.Errorf("parse -listen port from %q: %w", listenAddr, err)
+	}
+	if port == mainPort {
+		return 0, fmt.Errorf("comfyui.port %d must differ from the main -listen port %d", port, mainPort)
+	}
+	return port, nil
 }
 
 func configureTailcatListener(cfg *config.Config, keyPath string) error {
@@ -288,6 +314,68 @@ func main() {
 		proxyLog.Infof("Tailcat listening on virtual TCP port 80: %s", activeTailcat.Address())
 	}
 
+	// Dedicated ComfyUI listener (config.ComfyUI): a second HTTP listener that
+	// serves the comfyui_auto model at the path root, for ComfyUI clients that
+	// cannot address the /comfyui/ subdirectory. Like the main and Tailcat
+	// handlers it dispatches through activeSrv, so a hot reload is picked up
+	// without rebinding; only a port change restarts the listener (below).
+	comfyHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		activeMu.RLock()
+		srv := activeSrv
+		activeMu.RUnlock()
+		srv.ServeComfyUIPort(w, r)
+	})
+	startComfy := func(port int) (*http.Server, error) {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			return nil, fmt.Errorf("listen on :%d for the dedicated ComfyUI port: %w", port, err)
+		}
+		srv := &http.Server{Handler: comfyHandler}
+		go func() {
+			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("dedicated ComfyUI listener error", "error", err)
+			}
+		}()
+		return srv, nil
+	}
+	// activeComfy / activeComfyPort are guarded by activeMu because a hot
+	// reload may restart the listener while the signal handler reads it.
+	var activeComfy *http.Server
+	var activeComfyPort int
+
+	comfyPort, err := comfyListenPort(cfg, listenAddr)
+	if err != nil {
+		slog.Error("invalid dedicated ComfyUI port configuration", "error", err)
+		if activeTailcat != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			if cerr := activeTailcat.Close(ctx); cerr != nil {
+				proxyLog.Warnf("Tailcat server shutdown error: %v", cerr)
+			}
+			cancel()
+		}
+		initialSrv.Shutdown(shutdownTimeout)
+		initialStore.Close()
+		os.Exit(1)
+	}
+	if comfyPort > 0 {
+		activeComfy, err = startComfy(comfyPort)
+		if err != nil {
+			slog.Error("failed to start dedicated ComfyUI listener", "error", err)
+			if activeTailcat != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+				if cerr := activeTailcat.Close(ctx); cerr != nil {
+					proxyLog.Warnf("Tailcat server shutdown error: %v", cerr)
+				}
+				cancel()
+			}
+			initialSrv.Shutdown(shutdownTimeout)
+			initialStore.Close()
+			os.Exit(1)
+		}
+		activeComfyPort = comfyPort
+		proxyLog.Infof("ComfyUI dedicated port listening on http://:%d (all interfaces)", comfyPort)
+	}
+
 	httpServer := &http.Server{
 		Addr: listenAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -370,6 +458,55 @@ func main() {
 		applyLogSettings(newCfg)
 		if perfMon != nil {
 			perfMon.UpdateConfig(newCfg.Performance)
+		}
+
+		// Restart the dedicated ComfyUI listener only when its port changes;
+		// an unchanged port keeps the listener and picks up the new Server
+		// through the handler closure. A port that fails to bind keeps the
+		// previous listener, mirroring the keep-old-store reload behaviour.
+		activeMu.RLock()
+		currentComfyPort := activeComfyPort
+		activeMu.RUnlock()
+		desiredComfyPort := currentComfyPort
+		if p, cErr := comfyListenPort(newCfg, listenAddr); cErr != nil {
+			proxyLog.Warnf("invalid comfyui.port in reloaded config: %v; keeping the current dedicated ComfyUI listener", cErr)
+		} else {
+			desiredComfyPort = p
+		}
+		var staleComfy *http.Server
+		var staleComfyPort int
+		if desiredComfyPort != currentComfyPort {
+			if desiredComfyPort == 0 {
+				activeMu.Lock()
+				staleComfy = activeComfy
+				staleComfyPort = activeComfyPort
+				activeComfy = nil
+				activeComfyPort = 0
+				activeMu.Unlock()
+			} else {
+				nextComfy, sErr := startComfy(desiredComfyPort)
+				if sErr != nil {
+					proxyLog.Warnf("failed to start dedicated ComfyUI listener on :%d during reload: %v; keeping the current listener", desiredComfyPort, sErr)
+				} else {
+					activeMu.Lock()
+					staleComfy = activeComfy
+					staleComfyPort = activeComfyPort
+					activeComfy = nextComfy
+					activeComfyPort = desiredComfyPort
+					activeMu.Unlock()
+					proxyLog.Infof("ComfyUI dedicated port listening on http://:%d (all interfaces)", desiredComfyPort)
+				}
+			}
+		}
+		if staleComfy != nil {
+			cCtx, cCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			if shErr := staleComfy.Shutdown(cCtx); shErr != nil {
+				proxyLog.Warnf("dedicated ComfyUI listener shutdown error: %v", shErr)
+			}
+			cCancel()
+			if staleComfyPort != 0 {
+				proxyLog.Infof("dedicated ComfyUI listener :%d stopped", staleComfyPort)
+			}
 		}
 
 		if err := old.Shutdown(shutdownTimeout); err != nil {
@@ -476,6 +613,7 @@ func main() {
 				srv := activeSrv
 				st := activeStore
 				tailcatRuntime := activeTailcat
+				comfyRuntime := activeComfy
 				activeMu.RUnlock()
 
 				// Close long-lived SSE streams first so httpServer.Shutdown can
@@ -489,6 +627,11 @@ func main() {
 				defer cancel()
 				if err := httpServer.Shutdown(shutdownCtx); err != nil {
 					proxyLog.Warnf("http server shutdown error: %v", err)
+				}
+				if comfyRuntime != nil {
+					if err := comfyRuntime.Shutdown(shutdownCtx); err != nil {
+						proxyLog.Warnf("dedicated ComfyUI listener shutdown error: %v", err)
+					}
 				}
 				if tailcatRuntime != nil {
 					if err := tailcatRuntime.Close(shutdownCtx); err != nil {

@@ -21,9 +21,20 @@ type modelMacroConfig struct {
 	Macros MacroList `yaml:"macros"`
 }
 
+// AllocatedPort records one automatic ${PORT} assignment so later validation
+// can check other port settings (comfyui.port) against the allocated range.
+type AllocatedPort struct {
+	Port  int
+	Model string
+}
+
 type configMacroConfig struct {
 	Macros MacroList                   `yaml:"macros"`
 	Models map[string]modelMacroConfig `yaml:"models"`
+
+	// AllocatedPorts is populated during port allocation, in sorted model-ID
+	// allocation order. It is runtime state, not configuration input.
+	AllocatedPorts []AllocatedPort `yaml:"-"`
 }
 
 // validateMacro validates macro name and value constraints
@@ -184,6 +195,7 @@ func resolveConfigMacros(yamlStr string) (map[string]any, configMacroConfig, err
 			}
 
 			portMacro := MacroList{{Name: "PORT", Value: nextPort}}
+			declarations.AllocatedPorts = append(declarations.AllocatedPorts, AllocatedPort{Port: nextPort, Model: modelID})
 			resolved = substituteMacroList(model, portMacro)
 			model = resolved.(map[string]any)
 			if err := substituteSetParamsByIDKeys(model, portMacro); err != nil {

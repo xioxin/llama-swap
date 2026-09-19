@@ -204,6 +204,22 @@ upstream:
     # when the UI is open
     - ^\/ws$|^\/api\/jobs$
 
+# comfyui: settings for the dedicated ComfyUI listener
+# - optional, default: disabled (no listener)
+# - when port is set, llama-swap opens a second HTTP listener that serves the
+#   comfyui_auto model at the path root, so ComfyUI clients that cannot
+#   address the /comfyui/ subdirectory (e.g. ComfyUI MCP servers and
+#   comfy-cli) can use http://host:port directly
+# - unlike /comfyui/, any request path on the dedicated listener may start
+#   an unloaded model; websocket handling still follows the model
+#   compat.ignoreWebsockets setting
+# - the port binds all interfaces and must not collide with the main
+#   -listen port or a port allocated to a model via ${PORT}
+# - a port change on a configuration reload restarts the listener; a port
+#   that fails to bind keeps the previous listener with a warning
+comfyui:
+  port: 0
+
 # profiles: named model ID replacements switched at runtime through the UI or API
 # - optional, default: empty dictionary
 # - one profile or none is active; hooks.on_startup.profile selects the profile

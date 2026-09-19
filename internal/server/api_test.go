@@ -408,6 +408,167 @@ func TestServer_HandleComfyUI_UsesAuthentication(t *testing.T) {
 	}
 }
 
+// The dedicated ComfyUI port serves the model at the path root: unlike
+// /comfyui/, any path may start an unloaded model. Websocket-ignore
+// semantics (409 while unloaded, no lifecycle participation) are inherited
+// from the local router (baseRouter.ServeHTTP) and covered by the
+// TestBaseRouter_IgnoreWebsockets* tests.
+func TestServer_ServeComfyUIPort_StartsModelFromAnyPath(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "ok")
+	serveCalls := 0
+	var gotPath string
+	var gotQuery string
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		serveCalls++
+		gotPath = r.URL.EscapedPath()
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+
+	// The model is not loaded (local.running is nil): every path below may
+	// start it on the dedicated port.
+	tests := []struct {
+		path  string
+		wantP string
+		wantQ string
+	}{
+		{path: "/", wantP: "/"},
+		{path: "/api/prompt", wantP: "/api/prompt"},
+		{path: "/api/prompt?preview=1", wantP: "/api/prompt", wantQ: "preview=1"},
+		{path: "/ws", wantP: "/ws"},
+		{path: "/abc", wantP: "/abc"},
+		{path: "/view/image.png?type=output", wantP: "/view/image.png", wantQ: "type=output"},
+	}
+	for _, tt := range tests {
+		w := httptest.NewRecorder()
+		s.comfyHandler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, tt.path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status=%d want 200 body=%q", tt.path, w.Code, w.Body.String())
+		}
+		if gotPath != tt.wantP || gotQuery != tt.wantQ {
+			t.Errorf("%s path=%q query=%q want path=%q query=%q", tt.path, gotPath, gotQuery, tt.wantP, tt.wantQ)
+		}
+	}
+	if serveCalls != len(tests) {
+		t.Errorf("serveCalls=%d want %d", serveCalls, len(tests))
+	}
+}
+
+func TestServer_ServeComfyUIPort_PreservesEscapedPath(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "ok")
+	var gotPath string
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		w.WriteHeader(http.StatusOK)
+	}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+
+	tests := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{name: "encoded slash", target: "/api/userdata/workflows%2Fexample.json", want: "/api/userdata/workflows%2Fexample.json"},
+		{name: "double encoded slash", target: "/api/userdata/workflows%252Fexample.json", want: "/api/userdata/workflows%252Fexample.json"},
+		{name: "utf8 and encoded slash", target: "/api/%E2%9C%93%2Ffile.json", want: "/api/%E2%9C%93%2Ffile.json"},
+	}
+	for _, tt := range tests {
+		w := httptest.NewRecorder()
+		s.comfyHandler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, tt.target, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status=%d body=%q", tt.name, w.Code, w.Body.String())
+		}
+		if gotPath != tt.want {
+			t.Errorf("%s: path=%q want %q", tt.name, gotPath, tt.want)
+		}
+	}
+}
+
+func TestServer_ServeComfyUIPort_ContextPinned(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "ok")
+	var gotContext swaputil.ReqContextData
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		gotContext, _ = swaputil.ReadContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/prompt?model=other-model", nil)
+	w := httptest.NewRecorder()
+	s.comfyHandler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
+	}
+	if gotContext.Model != config.ComfyUIModelID || gotContext.ModelID != config.ComfyUIModelID {
+		t.Errorf("context=%+v want model %s", gotContext, config.ComfyUIModelID)
+	}
+}
+
+func TestServer_ServeComfyUIPort_RequiresExactLocalModel(t *testing.T) {
+	tests := []struct {
+		name  string
+		cfg   config.Config
+		local *stubRouter
+		peer  *stubRouter
+	}{
+		{
+			name:  "missing model",
+			cfg:   config.Config{},
+			local: newStubRouter(nil, ""),
+			peer:  newStubRouter(nil, ""),
+		},
+		{
+			name:  "peer model",
+			cfg:   config.Config{Models: map[string]config.ModelConfig{}},
+			local: newStubRouter(nil, ""),
+			peer:  newStubRouter([]string{config.ComfyUIModelID}, "peer"),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestServer(tt.local, tt.peer)
+			s.cfg = tt.cfg
+			s.routes()
+			w := httptest.NewRecorder()
+			s.comfyHandler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/", nil))
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("status=%d want 404 body=%q", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestServer_ServeComfyUIPort_UsesAuthentication(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "ok")
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{
+		RequiredAPIKeys: []string{"secret"},
+		Models:          map[string]config.ModelConfig{config.ComfyUIModelID: {}},
+	}
+	s.routes()
+
+	w := httptest.NewRecorder()
+	s.comfyHandler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/prompt", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status=%d want 401", w.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/prompt", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	w = httptest.NewRecorder()
+	s.comfyHandler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authenticated status=%d want 200 body=%q", w.Code, w.Body.String())
+	}
+}
 func TestProxy_HandleUpstreamPreservesEscapedPath(t *testing.T) {
 	tests := []struct {
 		name   string

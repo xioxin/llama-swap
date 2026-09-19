@@ -62,6 +62,11 @@ type Server struct {
 	mux     *http.ServeMux
 	handler http.Handler
 
+	// comfyHandler is the handler served on the optional dedicated ComfyUI
+	// listener (config.ComfyUIConfig). It is rebuilt with every Server, so a
+	// hot reload updates its auth and logging without touching the listener.
+	comfyHandler http.Handler
+
 	shutdownCtx    context.Context
 	shutdownFn     context.CancelFunc
 	shuttingDown   atomic.Bool
@@ -369,6 +374,15 @@ func (s *Server) routes() {
 	// root path may start an unloaded model.
 	mux.Handle("/comfyui", apiChain.ThenFunc(handleComfyUIRedirect))
 	mux.Handle("/comfyui/{comfyPath...}", apiChain.ThenFunc(s.handleComfyUI))
+
+	// Dedicated ComfyUI listener handler: the same narrow surface as the
+	// /comfyui endpoint (auth plus the global log/CORS wrap, no metrics or
+	// inflight tracking), with the fixed model pinned for every path.
+	s.comfyHandler = chain.New(
+		CreateRequestLogMiddleware(s.proxylog),
+		CreateCORSMiddleware(),
+		CreateAuthMiddleware(s.cfg),
+	).ThenFunc(s.ServeComfyUIPort)
 
 	// API group (API-key protected) consumed by the UI.
 	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))

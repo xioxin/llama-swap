@@ -454,11 +454,6 @@ func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
 // handleComfyUI proxies requests under /comfyui/ to the fixed local
 // ComfyUI model. Its compatibility settings are applied while loading config.
 func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
-		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
-		return
-	}
-
 	// Strip the /comfyui prefix before forwarding. URL.Path and PathValue are
 	// decoded, so retain the matching escaped suffix in RawPath exactly as the
 	// generic /upstream handler does.
@@ -467,10 +462,29 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 	r.URL.Path = remainingPath
 	r.URL.RawPath = escapedRemaining
 
-	// Only an explicit request for the ComfyUI root may start the model. Once
-	// it is unloaded, stale browser requests for assets, APIs, or websockets
-	// must not cause it to be loaded again.
-	if remainingPath != "/" {
+	s.serveComfyUI(w, r, remainingPath, true)
+}
+
+// ServeComfyUIPort serves the dedicated ComfyUI listener (see the
+// config.ComfyUIConfig docs). The client speaks ComfyUI directly at the path
+// root, so the request path is forwarded untouched and any path may start an
+// unloaded model. Websocket requests still follow the model's
+// compat.ignoreWebsockets setting enforced by the local router.
+func (s *Server) ServeComfyUIPort(w http.ResponseWriter, r *http.Request) {
+	s.serveComfyUI(w, r, r.URL.Path, false)
+}
+
+// serveComfyUI proxies a ComfyUI request to the fixed local ComfyUI model.
+// When rootOnlyStarts is true (the /comfyui/ endpoint), only the ComfyUI root
+// path may start the model: once it is unloaded, stale browser requests for
+// assets, APIs, or websockets must not cause it to be loaded again.
+func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request, remainingPath string, rootOnlyStarts bool) {
+	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
+		return
+	}
+
+	if rootOnlyStarts && remainingPath != "/" {
 		state, ok := s.local.RunningModels()[config.ComfyUIModelID]
 		if !ok || state != process.StateReady {
 			swaputil.SendResponse(w, r, http.StatusConflict,
