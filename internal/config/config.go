@@ -238,6 +238,10 @@ type Config struct {
 	// upstream controls behaviour of the /upstream passthrough endpoint
 	Upstream UpstreamConfig `yaml:"upstream"`
 
+	// ComfyUI configures the optional dedicated ComfyUI listener port.
+	// A nil section means the listener is disabled.
+	ComfyUI *ComfyUIConfig `yaml:"comfyui"`
+
 	// security groups CORS and related hardening settings, see issue #1133
 	Security SecurityConfig `yaml:"security"`
 

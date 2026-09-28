@@ -76,6 +76,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("startPort must be greater than 1")
 	}
 
+	if err := validateComfyUIPort(config, macroConfig.AllocatedPorts); err != nil {
+		return Config{}, err
+	}
+
 	if config.GlobalTTL < 0 {
 		return Config{}, fmt.Errorf("globalTTL must be >= 0")
 	}
