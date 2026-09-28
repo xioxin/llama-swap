@@ -74,6 +74,12 @@ type Server struct {
 	mux     *http.ServeMux
 	handler http.Handler
 
+	// comfyHandler is the logging, CORS and auth chain serving the fixed
+	// ComfyUI model on the dedicated comfyui.port listener. It is rebuilt
+	// per Server, like handler, so a configuration reload picks up new auth
+	// and logging settings without rebinding the listener.
+	comfyHandler http.Handler
+
 	shutdownCtx    context.Context
 	shutdownFn     context.CancelFunc
 	shuttingDown   atomic.Bool
@@ -395,6 +401,16 @@ func (s *Server) routes() {
 	mux.Handle("/comfyui", apiChain.ThenFunc(handleComfyUIRedirect))
 	mux.Handle("/comfyui/{comfyPath...}", apiChain.ThenFunc(s.handleComfyUI))
 
+	// Dedicated comfyui.port listener surface: the same logging, CORS and
+	// auth wrapping as the main handler, around the root-relative ComfyUI
+	// proxy. The listener itself is owned by main; a configuration reload
+	// rebuilds this chain per Server without rebinding the port.
+	s.comfyHandler = chain.New(
+		CreateRequestLogMiddleware(s.logs.HttpLogs),
+		CreateCORSMiddleware(s.cfg),
+		authMW,
+	).ThenFunc(s.serveComfyUI)
+
 	// API group (API-key protected) consumed by the UI.
 	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
 	mux.Handle("POST /api/models/unload/{model...}", apiChain.ThenFunc(s.handleAPIUnloadModel))
@@ -423,6 +439,13 @@ func (s *Server) routes() {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
+}
+
+// ServeComfyUIPort serves the dedicated comfyui.port listener. The request
+// path is already ComfyUI-root-relative; the logging, CORS and auth chain is
+// applied in routes().
+func (s *Server) ServeComfyUIPort(w http.ResponseWriter, r *http.Request) {
+	s.comfyHandler.ServeHTTP(w, r)
 }
 
 // ServeTailcatHTTP applies Tailcat's deliberately narrow HTTP capability

@@ -56,12 +56,8 @@ func comfyUIIgnoresPath(path string) bool {
 
 // handleComfyUI proxies requests under /comfyui/ to the fixed local
 // ComfyUI model. Its compatibility settings are applied while loading config.
+// It only strips the /comfyui prefix and then defers to serveComfyUI.
 func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
-		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
-		return
-	}
-
 	// Strip the /comfyui prefix before forwarding. URL.Path and PathValue are
 	// decoded, so retain the matching escaped suffix in RawPath exactly as the
 	// generic /upstream handler does.
@@ -69,10 +65,25 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 	escapedRemaining := swaputil.EscapedPathSuffix(r.URL.EscapedPath(), "/comfyui")
 	r.URL.Path = remainingPath
 	r.URL.RawPath = escapedRemaining
+	s.serveComfyUI(w, r)
+}
+
+// serveComfyUI proxies a request to the fixed local ComfyUI model and serves
+// it at the path root of the port it is received on. r.URL.Path must already
+// be ComfyUI-root-relative: handleComfyUI strips the /comfyui prefix, and
+// requests on the dedicated comfyui.port listener arrive root-relative.
+//
+// Both surfaces share the same start gating: while the model is not loaded, a
+// GET to an ignored path cannot start it (see comfyUIIgnoresPath).
+func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
+		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
+		return
+	}
 
 	// Only a GET is ignored. A write is a deliberate action even on an ignored
 	// path, so queueing a job still starts the model.
-	if r.Method == http.MethodGet && comfyUIIgnoresPath(remainingPath) {
+	if r.Method == http.MethodGet && comfyUIIgnoresPath(r.URL.Path) {
 		state, ok := s.local.RunningModels()[config.ComfyUIModelID]
 		if !ok || state != process.StateReady {
 			swaputil.SendResponse(w, r, http.StatusConflict,
