@@ -30,6 +30,13 @@ type ActivityRepository interface {
 	// Timestamp is replaced with the current time.
 	Insert(ctx context.Context, entry ActivityLogEntry) (ActivityLogEntry, error)
 
+	// Update overwrites the mutable outcome fields of an existing entry —
+	// duration, error, and metadata — identified by entry.ID. It is used to
+	// backfill a row after an asynchronous task (e.g. a ComfyUI workflow)
+	// reaches its terminal state. Timestamp, source, model, and path are left
+	// unchanged. It returns an error when no row has that ID.
+	Update(ctx context.Context, entry ActivityLogEntry) error
+
 	// List returns one page of entries matching the query, newest first
 	// unless the query says otherwise. Page and Limit are normalized with
 	// ActivityQuery.WithDefaults before use.

@@ -271,8 +271,8 @@ upstream:
     - ^\/ws(\/|$)
     - ^\/api\/jobs$
 
-# comfyui: settings for the dedicated ComfyUI listener
-# - optional, default: disabled (no listener)
+# comfyui: settings for the dedicated ComfyUI listener and swapping
+# - optional, default: disabled (no listener), swapMode: unload
 # - when port is set, llama-swap opens a second HTTP listener that serves the
 #   comfyui_auto model at the path root, so ComfyUI clients that cannot
 #   address the /comfyui/ subdirectory (e.g. ComfyUI MCP servers and
@@ -284,8 +284,23 @@ upstream:
 #   -listen port or a port allocated to a model via ${PORT}
 # - a port change on a configuration reload restarts the listener; a port
 #   that fails to bind keeps the previous listener with a warning
+#
+# swapMode: what swapping out ComfyUI for a mutually exclusive model does
+# - "unload" (default): stop the ComfyUI process, like every other model
+# - "cleanup": keep the process running and only free its GPU memory
+#   (POST /free) so the next swap-in is fast; TTL expiry and explicit
+#   unloads still stop the process
+# - ComfyUI must listen on 127.0.0.1 so every submit goes through
+#   llama-swap's queue and cannot bypass the swap order
+#
+# vramFreeFraction: VRAM still in use while ComfyUI counts as idle (0..1)
+# - ComfyUI keeps a small CUDA context resident even after freeing memory,
+#   so idle means the used fraction is below this threshold
+# - default 0.02; raise it if a resident context is larger than expected
 comfyui:
   port: 0
+  swapMode: unload
+  vramFreeFraction: 0.02
 
 # profiles: named model ID replacements switched at runtime through the UI or API
 # - optional, default: empty dictionary

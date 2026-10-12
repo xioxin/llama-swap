@@ -76,7 +76,7 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 		return Config{}, fmt.Errorf("startPort must be greater than 1")
 	}
 
-	if err := validateComfyUIPort(config, macroConfig.AllocatedPorts); err != nil {
+	if err := validateComfyUI(config, macroConfig.AllocatedPorts); err != nil {
 		return Config{}, err
 	}
 

@@ -82,6 +82,36 @@ func (r *activityRepository) Insert(ctx context.Context, entry store.ActivityLog
 	return entry, nil
 }
 
+// Update overwrites the mutable outcome fields of an existing row identified by
+// entry.ID. Only duration, error, and metadata change; the identity fields set
+// at Insert time are preserved.
+func (r *activityRepository) Update(ctx context.Context, entry store.ActivityLogEntry) error {
+	if entry.ID <= 0 {
+		return fmt.Errorf("update activity: missing id")
+	}
+	metadataJSON, err := marshalMetadata(entry.Metadata)
+	if err != nil {
+		return err
+	}
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE activity
+		SET duration_ms = ?, error_msg = ?, metadata_json = ?
+		WHERE id = ?`,
+		entry.DurationMs, entry.ErrorMsg, metadataJSON, entry.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("update activity: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update activity: %w", err)
+	}
+	if n == 0 {
+		return fmt.Errorf("update activity: no row with id %d", entry.ID)
+	}
+	return nil
+}
+
 func (r *activityRepository) List(ctx context.Context, query store.ActivityQuery) (store.ActivityPage, error) {
 	query = query.WithDefaults()
 	offset := (query.Page - 1) * query.Limit

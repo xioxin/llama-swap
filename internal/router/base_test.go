@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -725,5 +726,156 @@ func TestBaseRouter_Shutdown_StopsAllProcesses(t *testing.T) {
 	// Second Shutdown should report already in progress.
 	if err := b.Shutdown(0); err == nil {
 		t.Errorf("second Shutdown returned nil, want error")
+	}
+}
+
+// cleanupConfig builds a config with ComfyUI in cleanup mode pointing at the
+// test ComfyUI server, plus the fixed comfyui_auto model.
+func cleanupConfig(comfyURL string) config.Config {
+	return config.Config{
+		HealthCheckTimeout: 5,
+		ComfyUI: &config.ComfyUIConfig{
+			SwapMode:         config.SwapModeCleanup,
+			VramFreeFraction: 0.02,
+		},
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {
+				Proxy: comfyURL,
+				Cmd:   "svr",
+			},
+		},
+	}
+}
+
+// fakeComfyServer is a minimal ComfyUI stand-in for swap tests. It reports an
+// idle queue/VRAM and counts /free calls.
+type fakeComfyServer struct {
+	srv       *httptest.Server
+	freeCalls atomic.Int32
+	busy      atomic.Bool
+}
+
+func newFakeComfyServer() *fakeComfyServer {
+	f := &fakeComfyServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
+		if f.busy.Load() {
+			_, _ = w.Write([]byte(`{"queue_running":[{"prompt_id":"x"}],"queue_pending":[]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
+	})
+	mux.HandleFunc("/system_stats", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"devices":[{"vram_total":100,"vram_free":100}]}`))
+	})
+	mux.HandleFunc("/free", func(w http.ResponseWriter, r *http.Request) {
+		f.freeCalls.Add(1)
+		w.WriteHeader(200)
+	})
+	f.srv = httptest.NewServer(mux)
+	return f
+}
+
+func (f *fakeComfyServer) close() { f.srv.Close() }
+
+// TestBaseRouter_SoftUnload_KeepsComfyUIProcessRunning proves that in cleanup
+// mode swapping ComfyUI out frees its memory and does not stop the process.
+func TestBaseRouter_SoftUnload_KeepsComfyUIProcessRunning(t *testing.T) {
+	fc := newFakeComfyServer()
+	defer fc.close()
+
+	comfy := newFakeProcess(config.ComfyUIModelID)
+	comfy.markReady()
+	go comfy.Run(0)
+	other := newFakeProcess("other")
+	other.markReady()
+	go other.Run(0)
+
+	conf := cleanupConfig(fc.srv.URL)
+	b := newTestBaseWithConfig(t, conf,
+		map[string]process.Process{config.ComfyUIModelID: comfy, "other": other},
+		&stubPlanner{})
+
+	if b.comfyClient == nil {
+		t.Fatalf("comfyClient = nil, want built for cleanup mode")
+	}
+
+	// Directly exercise softUnload as doSwap's eviction would.
+	if !b.softUnload(config.ComfyUIModelID, comfy, time.Second) {
+		t.Fatalf("softUnload = false, want true (handled)")
+	}
+	if got := fc.freeCalls.Load(); got != 1 {
+		t.Errorf("freeCalls = %d, want 1", got)
+	}
+	if got := comfy.stopCalls.Load(); got != 0 {
+		t.Errorf("comfy.stopCalls = %d, want 0 (process kept running)", got)
+	}
+}
+
+// TestBaseRouter_SoftUnload_NonComfyUIStopNormally proves softUnload declines
+// to handle ordinary models (and ComfyUI outside cleanup mode), which are then
+// stopped by doSwap as usual.
+func TestBaseRouter_SoftUnload_NonComfyUIStopNormally(t *testing.T) {
+	fc := newFakeComfyServer()
+	defer fc.close()
+
+	other := newFakeProcess("other")
+	other.markReady()
+	go other.Run(0)
+
+	conf := cleanupConfig(fc.srv.URL)
+	b := newTestBaseWithConfig(t, conf,
+		map[string]process.Process{"other": other},
+		&stubPlanner{})
+
+	if b.softUnload("other", other, time.Second) {
+		t.Fatalf("softUnload(other) = true, want false (should stop normally)")
+	}
+}
+
+// TestBaseRouter_DoSwap_CleanupFreesWithoutStopping drives a full swap: the
+// eviction frees ComfyUI's memory while its process survives, then the target
+// starts.
+func TestBaseRouter_DoSwap_CleanupFreesWithoutStopping(t *testing.T) {
+	fc := newFakeComfyServer()
+	defer fc.close()
+
+	comfy := newFakeProcess(config.ComfyUIModelID)
+	comfy.markReady()
+	go comfy.Run(0)
+	target := newFakeProcess("target")
+	target.autoReady = true
+
+	conf := cleanupConfig(fc.srv.URL)
+	planner := &stubPlanner{evict: map[string][]string{"target": {config.ComfyUIModelID}}}
+	b := newTestBaseWithConfig(t, conf,
+		map[string]process.Process{config.ComfyUIModelID: comfy, "target": target},
+		planner)
+
+	// Issue a request for target; the swap evicts comfyui_auto. Drain
+	// testProcessed until the swap reports done (the swap is what frees
+	// ComfyUI memory and starts the target).
+	go func() {
+		w := httptest.NewRecorder()
+		b.ServeHTTP(w, newRequest("target"))
+	}()
+	deadline := time.After(3 * time.Second)
+	for target.State() != process.StateReady {
+		select {
+		case <-b.testProcessed:
+		case <-deadline:
+			t.Fatalf("timeout waiting for swap; target=%s freeCalls=%d",
+				target.State(), fc.freeCalls.Load())
+		}
+	}
+
+	if got := fc.freeCalls.Load(); got != 1 {
+		t.Errorf("freeCalls = %d, want 1", got)
+	}
+	if got := comfy.stopCalls.Load(); got != 0 {
+		t.Errorf("comfy.stopCalls = %d, want 0 (cleanup mode keeps process)", got)
+	}
+	if target.State() != process.StateReady {
+		t.Errorf("target state = %s, want ready", target.State())
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/comfy"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -37,6 +38,12 @@ type baseRouter struct {
 	processes map[string]process.Process
 	logger    *logmon.Monitor
 	schedule  scheduler.Scheduler
+
+	// comfyClient, when non-nil, talks to the fixed ComfyUI model so a
+	// cleanup-mode swap can free its GPU memory instead of stopping the
+	// process. It is built once in newBaseRouter when ComfyUI is configured
+	// for cleanup swapping.
+	comfyClient *comfy.Client
 
 	// shutdownCtx governs the request machinery: cancelling it tells grant()
 	// and ServeHTTP to stop granting and reject callers. It is deliberately
@@ -101,6 +108,20 @@ func newBaseRouter(
 		return nil, err
 	}
 	b.schedule = sched
+
+	// Build the ComfyUI client only when ComfyUI swaps in cleanup mode and its
+	// proxy is a usable absolute URL. The client resolves to the comfyui_auto
+	// model's proxy. A missing/invalid proxy leaves comfyClient nil and ComfyUI
+	// swaps like a normal (unload) model; config validation already warns when
+	// cleanup mode is set without a reachable proxy.
+	if conf.ComfyUI.CleanupMode() {
+		if m, ok := conf.Models[config.ComfyUIModelID]; ok && m.Proxy != "" {
+			// Each API call is short: probes and a single /free. Swap deadlines
+			// are enforced by the swap context, not the HTTP client timeout.
+			b.comfyClient = comfy.New(m.Proxy, 10*time.Second)
+		}
+	}
+
 	return b, nil
 }
 
@@ -248,6 +269,9 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 		wg.Add(1)
 		go func(p process.Process, id string) {
 			defer wg.Done()
+			if b.softUnload(id, p, timeout) {
+				return
+			}
 			if err := p.Stop(timeout); err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
@@ -273,6 +297,48 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Err: err}:
 	case <-b.shutdownCtx.Done():
 	}
+}
+
+// softUnload releases a cleanup-mode ComfyUI's GPU memory instead of stopping
+// its process. It returns true when it handled the model (so the caller must
+// not Stop the process), and false when the model should be stopped normally.
+//
+// A soft unload only applies to the fixed ComfyUI model while cleanup mode is
+// on and the process is actually running. If ComfyUI is already stopped the
+// call is a no-op that still reports true: there is nothing to stop. If the
+// process is not ready yet (still starting), softUnload backs off and lets the
+// caller Stop it, so a start in flight is not left half-way.
+//
+// The sequence mirrors what the user asked for: wait for ComfyUI's own
+// workflows to finish, then free its memory. The wait is bounded by timeout.
+func (b *baseRouter) softUnload(modelID string, p process.Process, timeout time.Duration) bool {
+	if modelID != config.ComfyUIModelID || b.comfyClient == nil {
+		return false
+	}
+	switch p.State() {
+	case process.StateStopped, process.StateShutdown, process.StateStopping:
+		return true
+	case process.StateStarting:
+		return false
+	}
+
+	// Wait for ComfyUI to drain its own prompt queue and drop its VRAM to the
+	// idle threshold, then issue the free. Bounded by timeout so a stuck
+	// workflow cannot block the swap forever; on timeout we still free memory
+	// (best effort) and let the swap proceed.
+	ctx, cancel := context.WithTimeout(b.shutdownCtx, timeout)
+	defer cancel()
+
+	vramFree := b.config.ComfyUI.IdleVramFreeFraction()
+	if err := b.comfyClient.WaitIdle(ctx, vramFree, 250*time.Millisecond); err != nil {
+		b.logger.Warnf("%s: ComfyUI did not drain before swap (proceeding to free memory): %v", b.name, err)
+	}
+	if err := b.comfyClient.FreeMemory(ctx); err != nil {
+		b.logger.Warnf("%s: freeing ComfyUI memory failed: %v", b.name, err)
+	} else {
+		b.logger.Debugf("%s: freed ComfyUI GPU memory (process kept running)", b.name)
+	}
+	return true
 }
 
 func (b *baseRouter) handleShutdown(req shutdownReq) {

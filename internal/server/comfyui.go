@@ -98,5 +98,17 @@ func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request) {
 		ModelID:  config.ComfyUIModelID,
 		Metadata: make(map[string]string),
 	}))
+
+	// A workflow submit is a task: it goes through the router's queue (so it
+	// waits for a mutually exclusive model to give up the GPU) and is tracked
+	// to its terminal state for the activity log. Tee the response so the
+	// prompt id can be read after the upstream writes it. Every other ComfyUI
+	// path is proxied straight through.
+	if isComfyPromptSubmit(r) {
+		recorder := wrapComfySubmit(w)
+		s.local.ServeHTTP(recorder, r)
+		recordComfySubmit(s, r, recorder)
+		return
+	}
 	s.local.ServeHTTP(w, r)
 }

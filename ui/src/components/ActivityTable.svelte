@@ -41,6 +41,7 @@
   import HeaderLabel from "./activity-table/HeaderLabel.svelte";
   import ViewCaptureButton from "./activity-table/ViewCaptureButton.svelte";
   import MetaCell from "./activity-table/MetaCell.svelte";
+  import StatusCell from "./activity-table/StatusCell.svelte";
   import ModelLink from "./activity-table/ModelLink.svelte";
   import MiddleEllipsis from "./activity-table/MiddleEllipsis.svelte";
   import SourceCell from "./activity-table/SourceCell.svelte";
@@ -383,7 +384,11 @@
         id: "resp_status_code",
         accessorKey: "resp_status_code",
         header: "Status",
-        cell: ({ row }) => String(row.original.resp_status_code || "-"),
+        cell: ({ row }) =>
+          renderComponent(StatusCell, {
+            statusCode: row.original.resp_status_code,
+            metadata: row.original.metadata,
+          }),
       },
       {
         id: "resp_content_type",

@@ -3,8 +3,8 @@ title: ComfyUI with the /comfyui endpoint
 summary: Name a model comfyui_auto and use /comfyui/ so ComfyUI's websocket does not block model swapping.
 category: guides
 tags: [comfyui, image, websocket, upstream, swapping, ttl, docker]
-config_keys: [models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
-updated: 2026-09-21
+config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
+updated: 2026-09-28
 ---
 
 # ComfyUI with the /comfyui endpoint
@@ -102,6 +102,52 @@ as usual: the page itself, `/api/prompt`, and any path not in the list.
 
 Query parameters are not part of the match, so `?clientId=...` makes no
 difference. `/wsapi` and `/api/jobs/12` are different paths and are not ignored.
+
+## Task queueing and swapping
+
+Submitting a workflow (`POST /prompt`) is treated as a task. It goes through
+llama-swap's normal request queue, so if a mutually exclusive model (a member of
+the same `routing` group) currently holds the GPU, the submit waits until that
+model is swapped out. Every other ComfyUI path is proxied straight through.
+
+Set `comfyui.swapMode` to control what "swapping ComfyUI out" means when another
+model needs the GPU:
+
+| swapMode | swap-out behaviour |
+| --- | --- |
+| `unload` (default) | stop the ComfyUI process, like every other model |
+| `cleanup` | keep the process running and only free its GPU memory (`POST /free`), so the next swap-in is fast |
+
+```yaml
+comfyui:
+  port: 8188
+  swapMode: cleanup
+  vramFreeFraction: 0.02
+```
+
+In `cleanup` mode a swap-out waits for ComfyUI's own running workflows to
+finish, then frees its memory and keeps the process warm. Swapping a model *in*
+over ComfyUI likewise waits for in-flight workflows and a memory free before the
+other model starts. TTL expiry and an explicit unload (`/unload`) still stop the
+process even in `cleanup` mode.
+
+ComfyUI keeps a small CUDA context resident even after freeing memory (tens to
+hundreds of MiB). `comfyui.vramFreeFraction` is the fraction of device VRAM that
+may still be in use and still count as idle; the default `0.02` tolerates that
+resident context. Raise it if idle detection reports busy when nothing runs.
+
+**ComfyUI must listen on `127.0.0.1`** so every submit goes through llama-swap's
+queue. A client that reaches ComfyUI's own port directly bypasses the queue and
+can start a workflow while a mutually exclusive model holds the GPU.
+
+## Activity
+
+Each submitted workflow appears as one row in the Activity view (`model` is
+`comfyui_auto`, path `/prompt`). The Status column shows the workflow's state
+(`running`, `completed`, `failed`, `cancelled`) and the Duration column shows how
+long it took from submit to terminal state. The row is updated in place when the
+workflow finishes; a workflow that is not observed within the tracking window is
+marked `unknown`.
 
 ## What goes wrong
 

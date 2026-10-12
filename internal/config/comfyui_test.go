@@ -82,3 +82,63 @@ func TestConfig_ComfyUIPort_Macro(t *testing.T) {
 	require.NotNil(t, cfg.ComfyUI)
 	assert.Equal(t, 8188, cfg.ComfyUI.Port)
 }
+
+func TestConfig_ComfyUISwapMode_DefaultUnload(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  port: 8188\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.Equal(t, "", cfg.ComfyUI.SwapMode)
+	assert.False(t, cfg.ComfyUI.CleanupMode())
+}
+
+func TestConfig_ComfyUISwapMode_Cleanup(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  swapMode: cleanup\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.True(t, cfg.ComfyUI.CleanupMode())
+}
+
+func TestConfig_ComfyUISwapMode_ExplicitUnload(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  swapMode: unload\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.False(t, cfg.ComfyUI.CleanupMode())
+}
+
+func TestConfig_ComfyUISwapMode_Invalid(t *testing.T) {
+	for _, mode := range []string{"soft", "Cleanup", "none"} {
+		content := plainModel + "comfyui:\n  swapMode: " + mode + "\n"
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		require.Error(t, err, "swapMode %q should be rejected", mode)
+		assert.Contains(t, err.Error(), "comfyui.swapMode")
+	}
+}
+
+func TestConfig_ComfyUIVramFreeFraction_Default(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  swapMode: cleanup\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.Equal(t, DefaultComfyUIVramFreeFraction, cfg.ComfyUI.IdleVramFreeFraction())
+}
+
+func TestConfig_ComfyUIVramFreeFraction_Custom(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  vramFreeFraction: 0.05\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.InDelta(t, 0.05, cfg.ComfyUI.IdleVramFreeFraction(), 1e-9)
+}
+
+func TestConfig_ComfyUIVramFreeFraction_OutOfRange(t *testing.T) {
+	for _, v := range []string{"-0.1", "1.5"} {
+		content := plainModel + "comfyui:\n  vramFreeFraction: " + v + "\n"
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		require.Error(t, err, "vramFreeFraction %s should be rejected", v)
+		assert.Contains(t, err.Error(), "comfyui.vramFreeFraction")
+	}
+}
+
+func TestConfig_ComfyUI_NilCleanupModeSafe(t *testing.T) {
+	var c *ComfyUIConfig
+	assert.False(t, c.CleanupMode())
+	assert.Equal(t, DefaultComfyUIVramFreeFraction, c.IdleVramFreeFraction())
+}

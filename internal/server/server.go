@@ -13,6 +13,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/capcompat"
 	"github.com/mostlygeek/llama-swap/internal/chain"
+	"github.com/mostlygeek/llama-swap/internal/comfy"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
@@ -79,6 +80,13 @@ type Server struct {
 	// per Server, like handler, so a configuration reload picks up new auth
 	// and logging settings without rebinding the listener.
 	comfyHandler http.Handler
+
+	// comfy is the lazily built ComfyUI API client used to track workflow
+	// submissions to their terminal state for the activity log. It is nil
+	// until the first submit needs it and only when comfyui_auto has a proxy.
+	// comfyMu guards the lazy build against concurrent submits.
+	comfy   *comfy.Client
+	comfyMu sync.Mutex
 
 	shutdownCtx    context.Context
 	shutdownFn     context.CancelFunc
