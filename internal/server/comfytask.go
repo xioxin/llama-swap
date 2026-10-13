@@ -24,29 +24,56 @@ const (
 	metaComfyStatus = "comfy_status"
 )
 
-// comfyPromptPath is the ComfyUI endpoint that starts a workflow. A POST here
-// is a task: it is queued through the router like any mutually exclusive model
-// request and then tracked to its terminal state for the activity log.
+// comfyPromptPath is the canonical ComfyUI submit path, used as the default
+// task-row ReqPath when a real request path is not being recorded.
 const comfyPromptPath = "/prompt"
 
+// comfyPromptPaths are the ComfyUI endpoints that start a workflow. ComfyUI
+// registers every route twice — once bare and once under the /api prefix (see
+// ComfyUI server.py add_routes) — and its web frontend submits to /api/prompt
+// while CLI/API clients use /prompt. Both are the same handler and must be
+// recognised as a task. A POST to either is queued through the router like any
+// mutually exclusive model request and tracked to its terminal state.
+var comfyPromptPaths = map[string]bool{
+	"/prompt":     true,
+	"/api/prompt": true,
+}
+
 // isComfyPromptSubmit reports whether r is a workflow submit on the ComfyUI
-// endpoint (POST /prompt). The path is checked root-relative, so it matches
-// both /comfyui/prompt and the dedicated comfyui.port listener.
+// endpoint. Only exact POST /prompt or POST /api/prompt (optional trailing
+// slash) count; the path is root-relative, so it matches both /comfyui/... and
+// the dedicated comfyui.port listener. A GET on either path is ComfyUI's queue
+// info query, not a submit.
 func isComfyPromptSubmit(r *http.Request) bool {
-	return r.Method == http.MethodPost && strings.TrimSuffix(r.URL.Path, "/") == comfyPromptPath
+	if r.Method != http.MethodPost {
+		return false
+	}
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	return comfyPromptPaths[path]
 }
 
 // isComfyDirect reports whether a ComfyUI request must be served straight to a
 // ready ComfyUI process and must NEVER enter the model scheduler — i.e. it can
 // neither queue for the GPU nor trigger a swap. Only a workflow submit
-// (POST /prompt) is allowed to swap; every other request (reads, settings
-// writes, uploads, interrupt, free, job cancel, static assets) is direct.
+// (POST /prompt or /api/prompt) is allowed to swap; every other request (reads,
+// settings writes, uploads, interrupt, free, job cancel, static assets) is
+// direct.
 //
 // This is what keeps the open ComfyUI UI from unloading a running LLM: a
 // history panel poll or a settings POST is not a reason to give ComfyUI the
 // GPU, so it must not reach EvictionFor.
 func isComfyDirect(r *http.Request) bool {
 	return !isComfyPromptSubmit(r)
+}
+
+// comfySubmitPath returns the normalised ComfyUI submit path recorded on an
+// activity/task row (e.g. "/api/prompt" or "/prompt").
+func comfySubmitPath(r *http.Request) string {
+	path := strings.TrimSuffix(r.URL.Path, "/")
+	if comfyPromptPaths[path] {
+		return path
+	}
+	return comfyPromptPath
 }
 
 // extractComfyPromptID pulls the prompt id from a ComfyUI POST /prompt response
@@ -203,7 +230,7 @@ func recordComfySubmit(s *Server, r *http.Request, recorder *responseBodyCopier)
 	row := store.ActivityLogEntry{
 		Timestamp:       recorder.StartTime(),
 		Model:           config.ComfyUIModelID,
-		ReqPath:         comfyPromptPath,
+		ReqPath:         comfySubmitPath(r),
 		RespContentType: recorder.Header().Get("Content-Type"),
 		RespStatusCode:  recorder.Status(),
 		Src:             activitySource(r),

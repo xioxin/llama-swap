@@ -105,7 +105,9 @@ difference. `/wsapi` and `/api/jobs/12` are different paths and are not ignored.
 
 ## What swaps and what does not
 
-**Only a workflow submit (`POST /prompt`) may swap another model out.** Every
+**Only a workflow submit (`POST /prompt` or `POST /api/prompt`) may swap another
+model out.** ComfyUI serves the same submit handler on both paths, and its web
+frontend uses `/api/prompt`. Every
 other ComfyUI request — reads, settings writes, uploads, `/interrupt`, `/free`,
 job cancels, static assets — is served straight to ComfyUI and **never** evicts
 a running LLM. So opening the history or asset panel cannot unload a model.

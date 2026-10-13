@@ -76,9 +76,16 @@ func TestComfy_IsPromptSubmit(t *testing.T) {
 		// stripped, and the dedicated port is already root-relative).
 		{http.MethodPost, "/prompt", true},
 		{http.MethodPost, "/prompt/", true},
+		// ComfyUI registers /api/prompt too, and its web frontend submits here.
+		{http.MethodPost, "/api/prompt", true},
+		{http.MethodPost, "/api/prompt/", true},
 		{http.MethodGet, "/prompt", false},
+		{http.MethodGet, "/api/prompt", false},
 		{http.MethodPost, "/history", false},
 		{http.MethodPost, "/interrupt", false},
+		{http.MethodPost, "/api/settings/Comfy.Queue.History.Expanded", false},
+		{http.MethodPost, "/api/prompts", false},
+		{http.MethodPost, "/api/prompt/extra", false},
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest(c.method, c.path, nil)
@@ -241,10 +248,16 @@ func TestComfy_DirectClassification(t *testing.T) {
 			t.Errorf("isComfyPromptSubmit(%s %s) = true, want false", c.method, c.path)
 		}
 	}
-	// Only the workflow submit is swappable work.
-	submit := httptest.NewRequest(http.MethodPost, "/prompt", nil)
-	if isComfyDirect(submit) {
-		t.Errorf("isComfyDirect(POST /prompt) = true, want false (it is the only swapper)")
+	// Only the workflow submits are swappable work: both /prompt and the
+	// frontend's /api/prompt must swap, not pass through.
+	for _, path := range []string{"/prompt", "/api/prompt"} {
+		submit := httptest.NewRequest(http.MethodPost, path, nil)
+		if isComfyDirect(submit) {
+			t.Errorf("isComfyDirect(POST %s) = true, want false (it is a swapper)", path)
+		}
+		if !isComfyPromptSubmit(submit) {
+			t.Errorf("isComfyPromptSubmit(POST %s) = false, want true", path)
+		}
 	}
 }
 
@@ -338,5 +351,43 @@ func TestServer_ComfyDirect_StartHoldsWhenCold(t *testing.T) {
 	}
 	if proc.serveCalls.Load() != 1 {
 		t.Errorf("serveCalls = %d, want 1", proc.serveCalls.Load())
+	}
+}
+
+// TestServer_ComfyPrompt_SwapsViaScheduler is the regression guard for "the
+// frontend POST /api/prompt did not swap the LLM out". Both /prompt and
+// /api/prompt must reach the scheduler (the only swapper) and record a task
+// row with the extracted prompt id.
+func TestServer_ComfyPrompt_SwapsViaScheduler(t *testing.T) {
+	for _, path := range []string{"/comfyui/prompt", "/comfyui/api/prompt"} {
+		local := newStubRouter([]string{config.ComfyUIModelID}, "")
+		local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"prompt_id":"wf-1","number":1,"node_errors":{}}`))
+		}
+		// A direct-process hit would mean no swap; it must NOT be used here.
+		proc := &fakeDirectProcess{response: `{}`}
+		local.directProcess = proc
+
+		s := newTestServerWithConfig(config.Config{
+			Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}},
+		}, local, newStubRouter(nil, ""))
+		defer s.store.Close()
+
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`)))
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200", path, w.Code)
+		}
+		if proc.serveCalls.Load() != 0 {
+			t.Errorf("%s used DirectProcess (%d calls); a submit must go through the scheduler", path, proc.serveCalls.Load())
+		}
+		entries := listActivity(t, s)
+		if len(entries) != 1 {
+			t.Fatalf("%s activity rows = %d, want 1", path, len(entries))
+		}
+		if entries[0].Metadata[metaComfyPromptID] != "wf-1" {
+			t.Errorf("%s prompt id = %q, want wf-1", path, entries[0].Metadata[metaComfyPromptID])
+		}
 	}
 }
