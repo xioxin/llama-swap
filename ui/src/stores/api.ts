@@ -15,6 +15,7 @@ import type {
   PlaygroundModelType,
   HardwareSnapshot,
   TailcatStatus,
+  ComfyJob,
 } from "../lib/types";
 import { appendActivityFilters, type ActivityFilters } from "../lib/activityFilters";
 import { connectionState } from "./theme";
@@ -384,6 +385,15 @@ export async function getActivityStats(model?: string): Promise<ActivityStatsDat
     throw new Error(`Failed to fetch activity stats: ${response.status}`);
   }
   return await response.json();
+}
+
+export async function getComfyJobs(): Promise<ComfyJob[]> {
+  const response = await fetch("/api/comfy/jobs");
+  if (!response.ok) {
+    throw new Error(`Failed to fetch comfy jobs: ${response.status}`);
+  }
+  const payload = await response.json();
+  return (payload.jobs ?? []) as ComfyJob[];
 }
 
 export async function unloadAllModels(): Promise<void> {

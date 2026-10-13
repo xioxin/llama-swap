@@ -4,11 +4,15 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/comfy"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
@@ -34,7 +38,9 @@ func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 		case comfy.StatusCancelled:
 			msg = `[["execution_interrupted",{}]]`
 		}
-		_, _ = w.Write([]byte(`{"abc":{"status":{"completed":true,"status_str":"success","messages":` + msg + `}}}`))
+		// Key the entry by the requested prompt id so JobState finds it.
+		id := strings.TrimPrefix(r.URL.Path, "/history/")
+		_, _ = w.Write([]byte(`{"` + id + `":{"status":{"completed":true,"status_str":"success","messages":` + msg + `}}}`))
 	})
 	f.srv = httptest.NewServer(mux)
 	return f
@@ -175,4 +181,74 @@ func listActivity(t *testing.T, s *Server) []store.ActivityLogEntry {
 		t.Fatalf("activity list: %v", err)
 	}
 	return page.Data
+}
+
+// fakeDirectProcess is a minimal process.Process that records ServeHTTP calls,
+// standing in for the real process behind DirectProcess.
+type fakeDirectProcess struct {
+	serveCalls atomic.Int32
+	response   string
+}
+
+func (f *fakeDirectProcess) Run(time.Duration) error         { return nil }
+func (f *fakeDirectProcess) WaitReady(context.Context) error { return nil }
+func (f *fakeDirectProcess) EnsureReady(context.Context, time.Duration) error {
+	return nil
+}
+func (f *fakeDirectProcess) Stop(time.Duration) error    { return nil }
+func (f *fakeDirectProcess) State() process.ProcessState { return process.StateReady }
+func (f *fakeDirectProcess) Status() process.Status      { return process.Status{State: process.StateReady} }
+func (f *fakeDirectProcess) Logger() *logmon.Monitor     { return nil }
+func (f *fakeDirectProcess) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.serveCalls.Add(1)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(f.response))
+}
+
+// TestComfy_PassthroughClassification proves only workflow submits queue; every
+// read and control call is a passthrough that must not wait behind a swap.
+func TestComfy_PassthroughClassification(t *testing.T) {
+	passthrough := []struct{ method, path string }{
+		{http.MethodGet, "/queue"},
+		{http.MethodGet, "/history/abc"},
+		{http.MethodGet, "/api/jobs"},
+		{http.MethodGet, "/system_stats"},
+		{http.MethodGet, "/view"},
+		{http.MethodGet, "/object_info"},
+		{http.MethodPost, "/interrupt"},
+		{http.MethodPost, "/free"},
+		{http.MethodPost, "/api/jobs/abc/cancel"},
+		{http.MethodPost, "/api/jobs/cancel"},
+	}
+	for _, c := range passthrough {
+		r := httptest.NewRequest(c.method, c.path, nil)
+		if !isComfyPassthrough(r) {
+			t.Errorf("isComfyPassthrough(%s %s) = false, want true", c.method, c.path)
+		}
+	}
+	// Only the workflow submit queues.
+	submit := httptest.NewRequest(http.MethodPost, "/prompt", nil)
+	if isComfyPassthrough(submit) {
+		t.Errorf("isComfyPassthrough(POST /prompt) = true, want false (it queues)")
+	}
+}
+
+// TestServer_ComfyPassthrough_BypassesQueue proves a read request is served
+// straight to the ready process (DirectProcess) rather than the scheduler.
+func TestServer_ComfyPassthrough_BypassesQueue(t *testing.T) {
+	proc := &fakeDirectProcess{response: `{"queue_running":[],"queue_pending":[]}`}
+	local := newStubRouter([]string{config.ComfyUIModelID}, "")
+	local.directProcess = proc
+
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/comfyui/queue", nil)
+	s.ServeHTTP(w, r)
+
+	if got := proc.serveCalls.Load(); got != 1 {
+		t.Errorf("direct ServeHTTP calls = %d, want 1 (passthrough bypasses queue)", got)
+	}
 }

@@ -945,3 +945,38 @@ func anySliceStrEqual(v any, want []string) bool {
 	}
 	return true
 }
+
+// TestInflight_RemoveForModel proves a phantom entry for an exited model is
+// force-removed, so it cannot linger in the UI or block a later swap.
+func TestInflight_RemoveForModel(t *testing.T) {
+	tr := newInflightTracker()
+
+	mkReq := func(model string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+		return r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{ModelID: model}))
+	}
+	id1 := tr.Add(mkReq("m1"), func() {})
+	_ = tr.Add(mkReq("m2"), func() {})
+	_ = id1
+
+	if got := tr.Current(); len(got.Requests) != 2 {
+		t.Fatalf("before = %d requests, want 2", len(got.Requests))
+	}
+
+	removed := tr.RemoveForModel("m1")
+	if removed != 1 {
+		t.Errorf("RemoveForModel(m1) = %d, want 1", removed)
+	}
+	after := tr.Current()
+	if len(after.Requests) != 1 {
+		t.Fatalf("after = %d requests, want 1", len(after.Requests))
+	}
+	if after.Requests[0].Model != "m2" {
+		t.Errorf("remaining model = %q, want m2", after.Requests[0].Model)
+	}
+
+	// Removing an unknown/no-op model is safe.
+	if got := tr.RemoveForModel("nope"); got != 0 {
+		t.Errorf("RemoveForModel(nope) = %d, want 0", got)
+	}
+}

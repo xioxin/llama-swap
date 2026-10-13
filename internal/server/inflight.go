@@ -120,6 +120,32 @@ func (t *inflightTracker) Remove(id string) {
 	t.mu.Unlock()
 }
 
+// RemoveForModel force-removes every tracked request for a model. It is the
+// reconciliation that clears phantom entries after a model's process stops:
+// a request that was still counted against a now-exited model would otherwise
+// linger in the UI and block swaps via conflictsWithInFlight. Returns the
+// number of entries removed.
+func (t *inflightTracker) RemoveForModel(model string) int {
+	if model == "" {
+		return 0
+	}
+	t.mu.Lock()
+	removed := 0
+	for id, req := range t.requests {
+		if req.entry.Model != model {
+			continue
+		}
+		delete(t.requests, id)
+		if req.timer != nil {
+			req.timer.Stop()
+		}
+		t.enqueueLocked(swaputil.InFlightRequestsEvent{Operation: inflightOperationRemove, ID: id})
+		removed++
+	}
+	t.mu.Unlock()
+	return removed
+}
+
 func (t *inflightTracker) SetResponseHeaders(id string, headers http.Header) {
 	values := headerMap(headers)
 	redactHeaders(values)

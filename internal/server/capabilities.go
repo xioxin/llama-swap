@@ -20,7 +20,12 @@ import (
 // state machine itself. So it must not do any work inline: the probe goes to
 // its own goroutine and this returns immediately.
 func (s *Server) onProcessStateChange(e swaputil.ProcessStateChangeEvent) {
+	// Whenever a model leaves the ready state (stopped/stopping/shutdown), any
+	// in-flight request still counted against it is a phantom: the process is
+	// gone or going. Clear them so they neither linger in the Activity panel
+	// nor block a later swap via conflictsWithInFlight.
 	if e.NewState != string(process.StateReady) {
+		s.inflight.RemoveForModel(e.ProcessName)
 		return
 	}
 	mc, ok := s.cfg.Models[e.ProcessName]

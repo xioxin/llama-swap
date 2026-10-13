@@ -3,8 +3,8 @@ title: ComfyUI with the /comfyui endpoint
 summary: Name a model comfyui_auto and use /comfyui/ so ComfyUI's websocket does not block model swapping.
 category: guides
 tags: [comfyui, image, websocket, upstream, swapping, ttl, docker]
-config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
-updated: 2026-09-28
+config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, comfyui.queueTimeout, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
+updated: 2026-10-12
 ---
 
 # ComfyUI with the /comfyui endpoint
@@ -105,10 +105,19 @@ difference. `/wsapi` and `/api/jobs/12` are different paths and are not ignored.
 
 ## Task queueing and swapping
 
-Submitting a workflow (`POST /prompt`) is treated as a task. It goes through
-llama-swap's normal request queue, so if a mutually exclusive model (a member of
-the same `routing` group) currently holds the GPU, the submit waits until that
-model is swapped out. Every other ComfyUI path is proxied straight through.
+Submitting a workflow (`POST /prompt`) is a task: it goes through llama-swap's
+request queue, so if a mutually exclusive model (a member of the same `routing`
+group) holds the GPU, the submit waits for that model to swap out.
+
+**Every other ComfyUI path stays responsive during a swap.** Read-only queries
+(`GET /queue`, `/history`, `/api/jobs`, `/system_stats`, `/view`, `/object_info`)
+and control calls (`POST /interrupt`, `/free`, job cancel) are served straight to
+the running ComfyUI process — never queued. So the open ComfyUI UI keeps working
+while a model swap is in flight; only workflow submits wait.
+
+`comfyui.queueTimeout` bounds how long a submit may wait in the queue before it
+is rejected with `503` (default `0` = wait forever). Set it so a client is not
+left hanging behind a stuck swap.
 
 Set `comfyui.swapMode` to control what "swapping ComfyUI out" means when another
 model needs the GPU:
@@ -123,31 +132,45 @@ comfyui:
   port: 8188
   swapMode: cleanup
   vramFreeFraction: 0.02
+  queueTimeout: 300
 ```
 
-In `cleanup` mode a swap-out waits for ComfyUI's own running workflows to
-finish, then frees its memory and keeps the process warm. Swapping a model *in*
-over ComfyUI likewise waits for in-flight workflows and a memory free before the
-other model starts. TTL expiry and an explicit unload (`/unload`) still stop the
-process even in `cleanup` mode.
+In `cleanup` mode a swap-out waits for ComfyUI's **own running workflows to
+finish** (its prompt queue empty), then frees its memory and keeps the process
+warm. Swapping a model *in* over ComfyUI does the same: it waits for in-flight
+workflows to finish and frees memory before the other model starts. TTL expiry
+and an explicit unload (`/unload`) still stop the process even in `cleanup` mode.
+
+The memory free is issued as soon as the workflow queue is empty — llama-swap
+does **not** wait for VRAM to drop first (a finished workflow keeps its memory
+until the free). After the free it briefly confirms VRAM was released, then
+proceeds regardless. The free and all status probes go directly to ComfyUI's own
+port, so they are never blocked by the swap they are unblocking.
 
 ComfyUI keeps a small CUDA context resident even after freeing memory (tens to
 hundreds of MiB). `comfyui.vramFreeFraction` is the fraction of device VRAM that
-may still be in use and still count as idle; the default `0.02` tolerates that
-resident context. Raise it if idle detection reports busy when nothing runs.
+may still be in use and still count as memory-free; the default `0.02` tolerates
+that resident context. Raise it if the post-free confirmation warns that VRAM
+was not released.
 
 **ComfyUI must listen on `127.0.0.1`** so every submit goes through llama-swap's
 queue. A client that reaches ComfyUI's own port directly bypasses the queue and
 can start a workflow while a mutually exclusive model holds the GPU.
 
-## Activity
+## Task visibility
 
-Each submitted workflow appears as one row in the Activity view (`model` is
-`comfyui_auto`, path `/prompt`). The Status column shows the workflow's state
-(`running`, `completed`, `failed`, `cancelled`) and the Duration column shows how
-long it took from submit to terminal state. The row is updated in place when the
-workflow finishes; a workflow that is not observed within the tracking window is
-marked `unknown`.
+Two places show ComfyUI workflow tasks:
+
+- **Activity panel → ComfyUI Tasks**: live queued/running prompts plus recent
+  finished ones, each with its state (`queued`, `running`, `completed`,
+  `failed`, `cancelled`) and duration.
+- **`GET /api/comfy/jobs`**: the same merged list as JSON — live prompts from
+  ComfyUI's queue plus terminal states recorded by the task tracker.
+
+Each submitted workflow also appears as a row in the main Activity table (`model`
+`comfyui_auto`, path `/prompt`); its Status column shows the workflow's terminal
+state and the row is updated in place when it finishes. A workflow not observed
+within the tracking window is marked `unknown`.
 
 ## What goes wrong
 

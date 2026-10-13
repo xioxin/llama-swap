@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/url"
+	"time"
 )
 
 // ComfyUI swap modes. SwapMode controls what "swapping out" ComfyUI means.
@@ -49,10 +50,25 @@ type ComfyUIConfig struct {
 	SwapMode string `yaml:"swapMode"`
 
 	// VramFreeFraction is the fraction of total device VRAM that may still
-	// be in use while ComfyUI counts as idle. Larger values tolerate a
-	// bigger resident CUDA context; smaller values are stricter. Defaults
-	// to DefaultComfyUIVramFreeFraction. Valid range 0..1.
+	// be in use while ComfyUI is treated as memory-free. Larger values
+	// tolerate a bigger resident CUDA context; smaller values are stricter.
+	// Defaults to DefaultComfyUIVramFreeFraction. Valid range 0..1.
 	VramFreeFraction float64 `yaml:"vramFreeFraction"`
+
+	// QueueTimeout is the maximum seconds a workflow submit (POST /prompt)
+	// waits in llama-swap's queue for the GPU before it is rejected with 503.
+	// 0 (the default) waits indefinitely. It bounds the request so a submit
+	// can never hang forever behind a stuck model swap.
+	QueueTimeout int `yaml:"queueTimeout"`
+}
+
+// QueueWait returns the maximum wait for a queued workflow submit. A nil
+// section or 0 means wait indefinitely (returns 0).
+func (c *ComfyUIConfig) QueueWait() time.Duration {
+	if c == nil || c.QueueTimeout <= 0 {
+		return 0
+	}
+	return time.Duration(c.QueueTimeout) * time.Second
 }
 
 // CleanupMode reports whether ComfyUI should be swapped out by clearing its
@@ -123,6 +139,9 @@ func validateComfyUISwap(c *ComfyUIConfig) error {
 	}
 	if c.VramFreeFraction < 0 || c.VramFreeFraction > 1 {
 		return fmt.Errorf("comfyui.vramFreeFraction must be between 0 and 1, got %g", c.VramFreeFraction)
+	}
+	if c.QueueTimeout < 0 {
+		return fmt.Errorf("comfyui.queueTimeout must be >= 0, got %d", c.QueueTimeout)
 	}
 	return nil
 }

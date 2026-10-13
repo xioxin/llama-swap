@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"regexp"
 	"strings"
@@ -99,14 +100,39 @@ func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request) {
 		Metadata: make(map[string]string),
 	}))
 
-	// A workflow submit is a task: it goes through the router's queue (so it
-	// waits for a mutually exclusive model to give up the GPU) and is tracked
-	// to its terminal state for the activity log. Tee the response so the
-	// prompt id can be read after the upstream writes it. Every other ComfyUI
-	// path is proxied straight through.
+	// Read-only queries and control calls (queue/history/jobs/view/interrupt/
+	// free/cancel) must stay responsive while a swap is in flight, so they are
+	// served straight to the running process — no queue, no swap wait. This is
+	// what keeps the ComfyUI UI alive during a model swap. A workflow submit
+	// (POST /prompt) is the one request that queues and is tracked.
+	if isComfyPassthrough(r) {
+		if p, ok := s.local.DirectProcess(config.ComfyUIModelID); ok {
+			p.ServeHTTP(w, r)
+			return
+		}
+		// Not ready: fall through to the scheduler so the request starts the
+		// model when allowed (writes), or is gated (ignored-path GETs above).
+	}
+
 	if isComfyPromptSubmit(r) {
+		// Bound how long a submit may sit in the swap queue. On timeout the
+		// request context is cancelled, which prunes the queued entry and lets
+		// the client retry instead of hanging forever behind a stuck swap.
+		if wait := s.cfg.ComfyUI.QueueWait(); wait > 0 {
+			ctx, cancel := context.WithTimeout(r.Context(), wait)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
 		recorder := wrapComfySubmit(w)
 		s.local.ServeHTTP(recorder, r)
+		if !recorder.WroteHeader() {
+			// The queue wait timed out (or the client left) before the request
+			// reached ComfyUI: report 503 so the submit is visibly rejected
+			// rather than leaving the connection to hang.
+			swaputil.SendResponse(w, r, http.StatusServiceUnavailable,
+				"comfyui: workflow submit timed out waiting for the queue")
+			return
+		}
 		recordComfySubmit(s, r, recorder)
 		return
 	}

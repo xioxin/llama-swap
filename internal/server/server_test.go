@@ -37,6 +37,7 @@ type stubRouter struct {
 	unloadModels  []string
 	unloadTimeout time.Duration
 	loggers       map[string]*logmon.Monitor
+	directProcess process.Process
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -76,6 +77,16 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 		if lg, ok := s.loggers[modelID]; ok {
 			return lg, true
 		}
+	}
+	return nil, false
+}
+
+// directProcess, when set, backs DirectProcess so passthrough-serving tests can
+// supply a fake process. Unset means "not ready" and the router falls back to
+// the scheduler path.
+func (s *stubRouter) DirectProcess(modelID string) (process.Process, bool) {
+	if s.directProcess != nil {
+		return s.directProcess, true
 	}
 	return nil, false
 }

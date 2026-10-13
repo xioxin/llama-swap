@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -141,4 +142,24 @@ func TestConfig_ComfyUI_NilCleanupModeSafe(t *testing.T) {
 	var c *ComfyUIConfig
 	assert.False(t, c.CleanupMode())
 	assert.Equal(t, DefaultComfyUIVramFreeFraction, c.IdleVramFreeFraction())
+}
+
+func TestConfig_ComfyUIQueueTimeout_Default(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  swapMode: cleanup\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.Equal(t, time.Duration(0), cfg.ComfyUI.QueueWait())
+}
+
+func TestConfig_ComfyUIQueueTimeout_Set(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  queueTimeout: 300\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.Equal(t, 300*time.Second, cfg.ComfyUI.QueueWait())
+}
+
+func TestConfig_ComfyUIQueueTimeout_Negative(t *testing.T) {
+	_, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  queueTimeout: -1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "comfyui.queueTimeout")
 }

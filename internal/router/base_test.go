@@ -753,6 +753,9 @@ type fakeComfyServer struct {
 	srv       *httptest.Server
 	freeCalls atomic.Int32
 	busy      atomic.Bool
+	// vramHeld makes /system_stats report the device as mostly used, so a
+	// naive "wait until VRAM is free before freeing" would spin forever.
+	vramHeld atomic.Bool
 }
 
 func newFakeComfyServer() *fakeComfyServer {
@@ -766,6 +769,10 @@ func newFakeComfyServer() *fakeComfyServer {
 		_, _ = w.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
 	})
 	mux.HandleFunc("/system_stats", func(w http.ResponseWriter, r *http.Request) {
+		if f.vramHeld.Load() {
+			_, _ = w.Write([]byte(`{"devices":[{"vram_total":100,"vram_free":5}]}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"devices":[{"vram_total":100,"vram_free":100}]}`))
 	})
 	mux.HandleFunc("/free", func(w http.ResponseWriter, r *http.Request) {
@@ -830,6 +837,48 @@ func TestBaseRouter_SoftUnload_NonComfyUIStopNormally(t *testing.T) {
 
 	if b.softUnload("other", other, time.Second) {
 		t.Fatalf("softUnload(other) = true, want false (should stop normally)")
+	}
+}
+
+// TestBaseRouter_SoftUnload_FreesWithoutWaitingForVram is the regression guard
+// for the swap deadlock. A finished workflow keeps its VRAM until /free, so
+// waiting for VRAM to drop before freeing spun until timeout and stalled every
+// queued request. softUnload must free memory as soon as the queue is empty,
+// even while VRAM is still reported high.
+func TestBaseRouter_SoftUnload_FreesWithoutWaitingForVram(t *testing.T) {
+	fc := newFakeComfyServer()
+	defer fc.close()
+	fc.vramHeld.Store(true) // VRAM high; queue empty
+
+	comfy := newFakeProcess(config.ComfyUIModelID)
+	comfy.markReady()
+	go comfy.Run(0)
+
+	conf := cleanupConfig(fc.srv.URL)
+	b := newTestBaseWithConfig(t, conf,
+		map[string]process.Process{config.ComfyUIModelID: comfy},
+		&stubPlanner{})
+
+	done := make(chan struct{})
+	go func() {
+		b.softUnload(config.ComfyUIModelID, comfy, 3*time.Second)
+		close(done)
+	}()
+
+	// The free must be issued promptly, without waiting for VRAM to drop. The
+	// post-free VRAM confirm is best-effort and may still be running.
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for fc.freeCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fc.freeCalls.Load(); got != 1 {
+		t.Fatalf("freeCalls = %d, want 1 (freed despite VRAM held)", got)
+	}
+	// softUnload must still return promptly despite VRAM never dropping.
+	select {
+	case <-done:
+	case <-time.After(6 * time.Second):
+		t.Fatalf("softUnload did not return after freeing")
 	}
 }
 

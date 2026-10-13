@@ -194,6 +194,17 @@ export interface HistogramData {
   p50: number;
 }
 
+export interface ComfyJob {
+  prompt_id: string;
+  status: string; // queued|running|completed|failed|cancelled|unknown
+  model: string;
+  req_path: string;
+  timestamp: string;
+  duration_ms: number;
+  error_msg?: string;
+  live: boolean;
+}
+
 export interface ActivityStatsData {
   total_requests: number;
   total_input_tokens: number;

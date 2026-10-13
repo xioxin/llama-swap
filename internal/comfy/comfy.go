@@ -24,7 +24,10 @@ import (
 type JobStatus string
 
 const (
-	// StatusRunning means the prompt has not reached a terminal state yet.
+	// StatusQueued means the prompt is pending in ComfyUI's queue, not yet
+	// executing.
+	StatusQueued JobStatus = "queued"
+	// StatusRunning means the prompt is currently executing.
 	StatusRunning JobStatus = "running"
 	// StatusCompleted means the prompt finished successfully.
 	StatusCompleted JobStatus = "completed"
@@ -39,6 +42,11 @@ const (
 // IsTerminal reports whether the status is a finished state.
 func (s JobStatus) IsTerminal() bool {
 	return s == StatusCompleted || s == StatusFailed || s == StatusCancelled
+}
+
+// IsPending reports whether the prompt still has work queued or executing.
+func (s JobStatus) IsPending() bool {
+	return s == StatusQueued || s == StatusRunning
 }
 
 // IdleState is one snapshot of whether ComfyUI is using the GPU.
@@ -204,13 +212,35 @@ func (c *Client) FreeMemory(ctx context.Context) error {
 // a context error on timeout/cancel. A failed probe resets the loop (not idle).
 // The first probe runs immediately; poll <= 0 falls back to 200ms.
 func (c *Client) WaitIdle(ctx context.Context, vramFreeFraction float64, poll time.Duration) error {
+	return c.wait(ctx, poll, func(st IdleState) bool { return st.IsIdle(vramFreeFraction) })
+}
+
+// WaitQueueEmpty blocks until ComfyUI has no running or pending workflow of its
+// own — the safe point to hand the GPU to another model. It ignores VRAM: a
+// finished workflow may still hold memory until a /free. poll <= 0 falls back
+// to 200ms. A failed probe resets the loop (treated as still busy).
+func (c *Client) WaitQueueEmpty(ctx context.Context, poll time.Duration) error {
+	return c.wait(ctx, poll, func(st IdleState) bool { return st.QueueEmpty })
+}
+
+// WaitVramReleased blocks until ComfyUI's VRAM usage drops to within
+// vramFreeFraction, i.e. the /free has taken effect. It is the post-free
+// confirmation, not a gate: callers give it a short bound and proceed on
+// timeout. poll <= 0 falls back to 200ms.
+func (c *Client) WaitVramReleased(ctx context.Context, vramFreeFraction float64, poll time.Duration) error {
+	return c.wait(ctx, poll, func(st IdleState) bool { return st.VramUsedFraction <= vramFreeFraction })
+}
+
+// wait polls IdleState until done reports true. The first probe runs
+// immediately; poll <= 0 falls back to 200ms. A failed probe resets the loop.
+func (c *Client) wait(ctx context.Context, poll time.Duration, done func(IdleState) bool) error {
 	if poll <= 0 {
 		poll = 200 * time.Millisecond
 	}
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
-		if st, err := c.IdleState(ctx); err == nil && st.IsIdle(vramFreeFraction) {
+		if st, err := c.IdleState(ctx); err == nil && done(st) {
 			return nil
 		}
 		select {
@@ -246,7 +276,7 @@ func (c *Client) JobState(ctx context.Context, promptID string) (JobStatus, erro
 		}
 		for _, item := range q.QueuePending {
 			if item.PromptID == promptID {
-				return StatusRunning, nil
+				return StatusQueued, nil
 			}
 		}
 	}
@@ -268,6 +298,40 @@ func (c *Client) JobState(ctx context.Context, promptID string) (JobStatus, erro
 		return StatusUnknown, nil
 	}
 	return classifyHistory(entry.Status.Completed, entry.Status.StatusStr, entry.Status.Messages), nil
+}
+
+// Job is one live ComfyUI prompt still queued or executing.
+type Job struct {
+	PromptID string
+	Status   JobStatus // StatusQueued or StatusRunning
+}
+
+// Jobs lists the prompts ComfyUI currently has queued or running. It is the
+// live-work view used for task visibility; terminal prompts are not included.
+func (c *Client) Jobs(ctx context.Context) ([]Job, error) {
+	var q struct {
+		QueueRunning []struct {
+			PromptID string `json:"prompt_id"`
+		} `json:"queue_running"`
+		QueuePending []struct {
+			PromptID string `json:"prompt_id"`
+		} `json:"queue_pending"`
+	}
+	if err := c.getJSON(ctx, "/queue", &q); err != nil {
+		return nil, err
+	}
+	jobs := make([]Job, 0, len(q.QueueRunning)+len(q.QueuePending))
+	for _, item := range q.QueueRunning {
+		if item.PromptID != "" {
+			jobs = append(jobs, Job{PromptID: item.PromptID, Status: StatusRunning})
+		}
+	}
+	for _, item := range q.QueuePending {
+		if item.PromptID != "" {
+			jobs = append(jobs, Job{PromptID: item.PromptID, Status: StatusQueued})
+		}
+	}
+	return jobs, nil
 }
 
 // classifyHistory maps a ComfyUI history status to a JobStatus. ComfyUI marks

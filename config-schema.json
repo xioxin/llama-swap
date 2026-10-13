@@ -844,7 +844,13 @@
                     "minimum": 0,
                     "maximum": 1,
                     "default": 0.02,
-                    "description": "Fraction of total device VRAM that may still be in use while ComfyUI counts as idle. ComfyUI keeps a small CUDA context resident even after freeing memory, so idle means the used fraction is below this threshold. Larger values tolerate a bigger resident context."
+                    "description": "Fraction of total device VRAM that may still be in use while ComfyUI is treated as memory-free. ComfyUI keeps a small CUDA context resident even after freeing memory, so free means the used fraction is below this threshold. Larger values tolerate a bigger resident context."
+                },
+                "queueTimeout": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Maximum seconds a workflow submit (POST /prompt) waits in llama-swap's queue for the GPU before it is rejected with 503. 0 (default) waits indefinitely. Bounds the request so a submit cannot hang forever behind a stuck model swap."
                 }
             },
             "additionalProperties": false,

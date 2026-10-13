@@ -309,8 +309,13 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 // process is not ready yet (still starting), softUnload backs off and lets the
 // caller Stop it, so a start in flight is not left half-way.
 //
-// The sequence mirrors what the user asked for: wait for ComfyUI's own
-// workflows to finish, then free its memory. The wait is bounded by timeout.
+// The sequence is the fix for the "ComfyUI freezes during a swap" deadlock:
+// the old order waited for VRAM to drop BEFORE freeing, but a finished workflow
+// keeps its memory until a /free, so VRAM never dropped and the swap spun until
+// timeout while every queued request stalled. The correct order is: wait only
+// for ComfyUI's own prompt queue to empty (its workflows finished), free the
+// memory immediately, then confirm (best effort) that VRAM actually dropped.
+// The confirm is not a gate — on timeout we proceed and warn.
 func (b *baseRouter) softUnload(modelID string, p process.Process, timeout time.Duration) bool {
 	if modelID != config.ComfyUIModelID || b.comfyClient == nil {
 		return false
@@ -322,19 +327,30 @@ func (b *baseRouter) softUnload(modelID string, p process.Process, timeout time.
 		return false
 	}
 
-	// Wait for ComfyUI to drain its own prompt queue and drop its VRAM to the
-	// idle threshold, then issue the free. Bounded by timeout so a stuck
-	// workflow cannot block the swap forever; on timeout we still free memory
-	// (best effort) and let the swap proceed.
 	ctx, cancel := context.WithTimeout(b.shutdownCtx, timeout)
 	defer cancel()
 
-	vramFree := b.config.ComfyUI.IdleVramFreeFraction()
-	if err := b.comfyClient.WaitIdle(ctx, vramFree, 250*time.Millisecond); err != nil {
-		b.logger.Warnf("%s: ComfyUI did not drain before swap (proceeding to free memory): %v", b.name, err)
+	// Wait only for ComfyUI's workflows to finish (QueueEmpty), NOT for its
+	// VRAM to drop — a finished workflow still holds memory. Bounded by
+	// timeout so a stuck workflow cannot block the swap forever.
+	if err := b.comfyClient.WaitQueueEmpty(ctx, 250*time.Millisecond); err != nil {
+		b.logger.Warnf("%s: ComfyUI workflows did not finish before swap (freeing memory anyway): %v", b.name, err)
 	}
+
+	// Free memory right away. This is a direct call to ComfyUI's own port, so
+	// it is never queued behind the swap it is unblocking.
 	if err := b.comfyClient.FreeMemory(ctx); err != nil {
 		b.logger.Warnf("%s: freeing ComfyUI memory failed: %v", b.name, err)
+		return true
+	}
+
+	// Confirm the free took effect (best effort, short bound). A slow or
+	// incomplete free must not deadlock the swap again.
+	vramFree := b.config.ComfyUI.IdleVramFreeFraction()
+	confirmCtx, confirmCancel := context.WithTimeout(b.shutdownCtx, 3*time.Second)
+	defer confirmCancel()
+	if err := b.comfyClient.WaitVramReleased(confirmCtx, vramFree, 250*time.Millisecond); err != nil {
+		b.logger.Warnf("%s: ComfyUI VRAM not confirmed released after free (proceeding): %v", b.name, err)
 	} else {
 		b.logger.Debugf("%s: freed ComfyUI GPU memory (process kept running)", b.name)
 	}
@@ -424,6 +440,22 @@ func (b *baseRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 		return p.Logger(), true
 	}
 	return nil, false
+}
+
+// DirectProcess returns the raw process for a model so a caller can serve a
+// request straight to it, bypassing the scheduler's swap/queue machinery. This
+// is for ComfyUI read-only and control paths that must stay responsive while a
+// swap is in flight. It reports false when the model is unknown to this router
+// or is not currently ready (the caller decides how to answer).
+func (b *baseRouter) DirectProcess(modelID string) (process.Process, bool) {
+	p, ok := b.processes[modelID]
+	if !ok {
+		return nil, false
+	}
+	if p.State() != process.StateReady {
+		return nil, false
+	}
+	return p, true
 }
 
 // RunningModels returns the current state of every process that is not stopped

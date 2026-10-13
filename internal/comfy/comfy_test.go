@@ -230,7 +230,60 @@ func TestComfy_WaitIdle_BecomesIdle(t *testing.T) {
 	}
 }
 
+func TestComfy_WaitQueueEmpty_IgnoresVram(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	// Queue empty but VRAM still held: WaitQueueEmpty must return (VRAM is not
+	// its concern), unlike WaitIdle.
+	f.statsJSON = `{"devices":[{"vram_total":100,"vram_free":10}]}`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := f.client().WaitQueueEmpty(ctx, 5*time.Millisecond); err != nil {
+		t.Fatalf("WaitQueueEmpty: %v", err)
+	}
+}
+
+func TestComfy_WaitQueueEmpty_WaitsForWorkflow(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.queueJSON = `{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := f.client().WaitQueueEmpty(ctx, 5*time.Millisecond); err == nil {
+		t.Fatalf("WaitQueueEmpty error = nil, want timeout while a workflow runs")
+	}
+}
+
+func TestComfy_WaitVramReleased_ConfirmsFree(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	// VRAM still held -> not released; a short confirm times out.
+	f.statsJSON = `{"devices":[{"vram_total":100,"vram_free":10}]}`
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := f.client().WaitVramReleased(ctx, 0.02, 5*time.Millisecond); err == nil {
+		t.Fatalf("WaitVramReleased error = nil, want timeout while VRAM held")
+	}
+}
+
 func TestComfy_JobState_Running(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.queueJSON = `{"queue_running":[{"prompt_id":"abc"}],"queue_pending":[]}`
+
+	got, err := f.client().JobState(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("JobState: %v", err)
+	}
+	if got != StatusRunning {
+		t.Errorf("JobState = %q, want running", got)
+	}
+}
+
+func TestComfy_JobState_Queued(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
 	f.queueJSON = `{"queue_running":[],"queue_pending":[{"prompt_id":"abc"}]}`
@@ -239,8 +292,32 @@ func TestComfy_JobState_Running(t *testing.T) {
 	if err != nil {
 		t.Fatalf("JobState: %v", err)
 	}
-	if got != StatusRunning {
-		t.Errorf("JobState = %q, want running", got)
+	if got != StatusQueued {
+		t.Errorf("JobState = %q, want queued", got)
+	}
+}
+
+func TestComfy_Jobs_ListsLiveWork(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.queueJSON = `{"queue_running":[{"prompt_id":"r1"}],"queue_pending":[{"prompt_id":"p1"},{"prompt_id":"p2"}]}`
+
+	jobs, err := f.client().Jobs(context.Background())
+	if err != nil {
+		t.Fatalf("Jobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("Jobs = %d, want 3", len(jobs))
+	}
+	byID := map[string]JobStatus{}
+	for _, j := range jobs {
+		byID[j.PromptID] = j.Status
+	}
+	if byID["r1"] != StatusRunning {
+		t.Errorf("r1 = %q, want running", byID["r1"])
+	}
+	if byID["p1"] != StatusQueued || byID["p2"] != StatusQueued {
+		t.Errorf("pending = %q,%q, want queued,queued", byID["p1"], byID["p2"])
 	}
 }
 

@@ -293,7 +293,7 @@ upstream:
 # - ComfyUI must listen on 127.0.0.1 so every submit goes through
 #   llama-swap's queue and cannot bypass the swap order
 #
-# vramFreeFraction: VRAM still in use while ComfyUI counts as idle (0..1)
+# vramFreeFraction: VRAM still in use while ComfyUI counts as memory-free (0..1)
 # - ComfyUI keeps a small CUDA context resident even after freeing memory,
 #   so idle means the used fraction is below this threshold
 # - default 0.02; raise it if a resident context is larger than expected
@@ -301,6 +301,9 @@ comfyui:
   port: 0
   swapMode: unload
   vramFreeFraction: 0.02
+  # queueTimeout: max seconds a workflow submit (POST /prompt) waits in the
+  # queue before it is rejected with 503. 0 (default) waits indefinitely.
+  queueTimeout: 0
 
 # profiles: named model ID replacements switched at runtime through the UI or API
 # - optional, default: empty dictionary

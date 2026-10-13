@@ -57,4 +57,9 @@ type LocalRouter interface {
 	// modelID must be a real (non-alias) config key. Returns false when the
 	// model is not known to this router.
 	ProcessLogger(modelID string) (*logmon.Monitor, bool)
+
+	// DirectProcess returns the ready process for a model so a caller can
+	// serve a request straight to it, bypassing the scheduler's swap/queue
+	// machinery. Returns false when the model is unknown or not ready.
+	DirectProcess(modelID string) (process.Process, bool)
 }
