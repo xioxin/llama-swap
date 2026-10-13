@@ -141,6 +141,12 @@ func ParseHistory(body []byte) (*Capture, error) {
 
 	cap.Nodes = parseNodes(rec.Prompt)
 	cap.Outputs = parseOutputs(rec.Outputs)
+	if cap.Nodes == nil {
+		cap.Nodes = []CaptureNode{}
+	}
+	if cap.Outputs == nil {
+		cap.Outputs = []Output{}
+	}
 
 	if cap.WorkflowUI == nil && cap.WorkflowAPI == nil && len(cap.Outputs) == 0 {
 		return nil, fmt.Errorf("comfy: history record %q has no workflow or outputs", promptID)
@@ -203,7 +209,7 @@ var modelInputKeys = map[string]bool{
 // parseNodes summarises the executable graph (prompt[2]) into node + model info.
 func parseNodes(prompt []json.RawMessage) []CaptureNode {
 	if len(prompt) < 3 {
-		return nil
+		return []CaptureNode{}
 	}
 	var graph map[string]struct {
 		ClassType string `json:"class_type"`
@@ -213,7 +219,7 @@ func parseNodes(prompt []json.RawMessage) []CaptureNode {
 		Inputs map[string]json.RawMessage `json:"inputs"`
 	}
 	if err := json.Unmarshal(prompt[2], &graph); err != nil {
-		return nil
+		return []CaptureNode{}
 	}
 	nodes := make([]CaptureNode, 0, len(graph))
 	for id, n := range graph {
@@ -252,7 +258,7 @@ func nodeLess(a, b CaptureNode) bool {
 
 // parseOutputs flattens every produced file across nodes into Output entries.
 func parseOutputs(outputs map[string]map[string][]outputFile) []Output {
-	var list []Output
+	list := make([]Output, 0)
 	for nodeID, byKey := range outputs {
 		for _, files := range byKey {
 			for _, f := range files {

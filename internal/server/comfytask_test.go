@@ -22,6 +22,11 @@ type fakeComfyUpstream struct {
 	srv       *httptest.Server
 	status    comfy.JobStatus
 	liveQueue string
+	// vanish models a task cancelled while queued: it is in the queue at first,
+	// then disappears from both the queue and history.
+	vanish atomic.Bool
+	// holdsID is the prompt id the queue reports while not vanished.
+	holdsID string
 }
 
 func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
@@ -32,10 +37,20 @@ func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 			_, _ = w.Write([]byte(f.liveQueue))
 			return
 		}
+		if f.holdsID != "" && !f.vanish.Load() {
+			_, _ = w.Write([]byte(`{"queue_running":[],"queue_pending":[[1,"` + f.holdsID + `",{}, {}, []]]}`))
+			return
+		}
 		// Never in the queue: terminal state is read from /history.
 		_, _ = w.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
 	})
 	mux.HandleFunc("/history/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/history/")
+		if f.vanish.Load() {
+			// Cancelled before it ran: no history record at all.
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		msg := `[]`
 		switch f.status {
 		case comfy.StatusFailed:
@@ -43,8 +58,6 @@ func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 		case comfy.StatusCancelled:
 			msg = `[["execution_interrupted",{}]]`
 		}
-		// Key the entry by the requested prompt id so JobState finds it.
-		id := strings.TrimPrefix(r.URL.Path, "/history/")
 		_, _ = w.Write([]byte(`{"` + id + `":{"status":{"completed":true,"status_str":"success","messages":` + msg + `}}}`))
 	})
 	f.srv = httptest.NewServer(mux)
@@ -389,5 +402,70 @@ func TestServer_ComfyPrompt_SwapsViaScheduler(t *testing.T) {
 		if entries[0].Metadata[metaComfyPromptID] != "wf-1" {
 			t.Errorf("%s prompt id = %q, want wf-1", path, entries[0].Metadata[metaComfyPromptID])
 		}
+	}
+}
+
+// TestComfyTask_CancelledWhileQueued proves a task that ComfyUI drops from its
+// queue before starting (cancelled in the ComfyUI UI) is finalised as
+// cancelled, not left stuck as running.
+func TestComfyTask_CancelledWhileQueued(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+	fc.holdsID = "q1"      // first seen in the pending queue
+	fc.vanish.Store(false) // ... then it disappears from queue and history
+
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	}
+	s := newTestServerWithConfig(cfg, nil, nil)
+	defer s.store.Close()
+
+	// Speed up the poll so the test does not wait a full interval per tick.
+	tracker := newComfyTaskTracker(s)
+	row := store.ActivityLogEntry{Timestamp: time.Now(), Model: config.ComfyUIModelID, ReqPath: comfyPromptPath}
+	tracker.track(row, "q1")
+
+	// Let the tracker observe the prompt in the queue at least once.
+	time.Sleep(50 * time.Millisecond)
+	fc.vanish.Store(true)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		entries := listActivity(t, s)
+		if entries[0].Metadata[metaComfyStatus] == string(comfy.StatusCancelled) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("status never resolved; got %q, want cancelled", listActivity(t, s)[0].Metadata[metaComfyStatus])
+}
+
+// TestComfyTask_NotYetRegisteredIsNotCancelled proves a prompt ComfyUI has not
+// yet put in its queue is not prematurely marked cancelled while it is still
+// being registered.
+func TestComfyTask_NotYetRegisteredIsNotCancelled(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+	// Queue empty and no history from the very first poll: prompt never seen.
+	fc.vanish.Store(true)
+
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	}
+	s := newTestServerWithConfig(cfg, nil, nil)
+	defer s.store.Close()
+
+	tracker := newComfyTaskTracker(s)
+	tracker.track(store.ActivityLogEntry{Timestamp: time.Now(), Model: config.ComfyUIModelID, ReqPath: comfyPromptPath}, "never-seen")
+
+	// It must remain running (awaiting), not flip to cancelled.
+	time.Sleep(300 * time.Millisecond)
+	entries := listActivity(t, s)
+	if entries[0].Metadata[metaComfyStatus] != string(comfy.StatusRunning) {
+		t.Errorf("status = %q, want running (still awaiting registration)", entries[0].Metadata[metaComfyStatus])
 	}
 }

@@ -147,11 +147,29 @@ func (t *comfyTaskTracker) awaitTerminal(row store.ActivityLogEntry, promptID st
 	ctx, cancel := context.WithTimeout(context.Background(), t.server.comfyTrackWindow())
 	defer cancel()
 
+	// seenLive records that ComfyUI has acknowledged the prompt (it appeared in
+	// the running/pending queue). A prompt that later vanishes from both the
+	// queue and history was cancelled before it ever ran — ComfyUI removes such
+	// an item on cancel and never records it in history. We only conclude
+	// "cancelled" after it was once seen, so a submit that ComfyUI has not yet
+	// registered is not falsely marked cancelled.
+	seenLive := false
+
 	for {
 		status, err := client.JobState(ctx, promptID)
-		if err == nil && status.IsTerminal() {
-			t.finalize(row, promptID, status)
-			return
+		if err == nil {
+			if status.IsTerminal() {
+				t.finalize(row, promptID, status)
+				return
+			}
+			if status == comfy.StatusQueued || status == comfy.StatusRunning {
+				seenLive = true
+			} else if seenLive {
+				// Was live, now neither queued nor in history: cancelled before
+				// start.
+				t.finalize(row, promptID, comfy.StatusCancelled)
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.finalize(row, promptID, comfy.StatusUnknown)

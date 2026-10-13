@@ -2,6 +2,7 @@ package comfy
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -172,5 +173,37 @@ func TestComfy_CaptureJSONRoundTrip(t *testing.T) {
 	}
 	if out.PromptID != cap.PromptID || len(out.Outputs) != 1 {
 		t.Errorf("round trip mismatch: %+v", out)
+	}
+}
+
+// TestComfy_ParseHistory_NonNilArrays proves outputs and nodes are always
+// non-nil arrays so the UI never reads .length on null for a bare/cancelled
+// record.
+func TestComfy_ParseHistory_NonNilArrays(t *testing.T) {
+	// A record with a workflow but no outputs and an empty graph.
+	fixture := `{
+	  "x": {
+	    "prompt": [0, "x", {}, {"extra_pnginfo": {"workflow": {"nodes": []}}}, []],
+	    "outputs": {},
+	    "status": {"status_str": "success", "completed": true, "messages": []}
+	  }
+	}`
+	cap, err := ParseHistory([]byte(fixture))
+	if err != nil {
+		t.Fatalf("ParseHistory: %v", err)
+	}
+	if cap.Outputs == nil {
+		t.Errorf("Outputs = nil, want empty slice")
+	}
+	if cap.Nodes == nil {
+		t.Errorf("Nodes = nil, want empty slice")
+	}
+	if len(cap.Outputs) != 0 || len(cap.Nodes) != 0 {
+		t.Errorf("outputs=%d nodes=%d, want empty", len(cap.Outputs), len(cap.Nodes))
+	}
+	// And they survive a JSON round trip as [] not null.
+	b, _ := json.Marshal(cap)
+	if strings.Contains(string(b), `"outputs":null`) || strings.Contains(string(b), `"nodes":null`) {
+		t.Errorf("serialized null arrays: %s", b)
 	}
 }

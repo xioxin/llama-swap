@@ -101,6 +101,13 @@
     for (const n of capture?.nodes ?? []) for (const m of n.models ?? []) set.add(m);
     return [...set].sort();
   });
+
+  // Outputs and nodes may be null/absent (a task cancelled before it ran, or a
+  // snapshot with no graph). Normalise to arrays so the template never reads
+  // .length or iterates over null.
+  let outputs = $derived(capture?.outputs ?? []);
+  let nodeList = $derived(capture?.nodes ?? []);
+  let comfyStatus = $derived(capture?.status ?? { status_str: "", completed: false, started_at_ms: 0, finished_at_ms: 0, duration_ms: 0, cached_nodes: 0 });
 </script>
 
 <Dialog.Root
@@ -118,15 +125,15 @@
         <Dialog.Title class="flex items-center gap-2 text-lg font-bold">
           ComfyUI Workflow
           <span class="font-mono text-sm font-normal text-muted-foreground">{capture.prompt_id}</span>
-          <span class="rounded px-1.5 py-0.5 text-xs {capture.status.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-red-500/15 text-red-600 dark:text-red-400'}">
-            {capture.status.status_str || (capture.status.completed ? "completed" : "incomplete")}
+          <span class="rounded px-1.5 py-0.5 text-xs {comfyStatus.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-red-500/15 text-red-600 dark:text-red-400'}">
+            {comfyStatus.status_str || (comfyStatus.completed ? "completed" : "incomplete")}
           </span>
         </Dialog.Title>
       </Dialog.Header>
 
       <!-- Tabs -->
       <div class="flex gap-1 border-b border-border px-4 pt-2">
-        {#each ([["outputs", `Outputs (${capture.outputs.length})`], ["workflow", "Workflow"], ["details", "Details"]] as [Tab, string][]) as [id, label]}
+        {#each ([["outputs", `Outputs (${outputs.length})`], ["workflow", "Workflow"], ["details", "Details"]] as [Tab, string][]) as [id, label]}
           <button
             class="rounded-t px-3 py-1.5 text-sm {tab === id ? 'border-b-2 border-primary font-medium text-primary' : 'text-muted-foreground hover:text-foreground'}"
             onclick={() => (tab = id)}
@@ -138,11 +145,11 @@
 
       <div class="min-h-0 flex-1 overflow-y-auto p-4">
         {#if tab === "outputs"}
-          {#if capture.outputs.length === 0}
+          {#if outputs.length === 0}
             <p class="text-sm text-muted-foreground">No output files recorded.</p>
           {:else}
             <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {#each capture.outputs as o (o.node_id + o.filename)}
+              {#each outputs as o (o.node_id + o.filename)}
                 <div class="rounded-md border border-border overflow-hidden">
                   <div class="flex items-center justify-center bg-muted/30 aspect-video">
                     {#if !previewable(o)}
@@ -211,10 +218,10 @@
           <!-- Details -->
           <div class="space-y-4">
             <div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <div><div class="text-xs text-muted-foreground">Duration</div><div class="text-sm">{capture.status.duration_ms ? formatDuration(capture.status.duration_ms) : "-"}</div></div>
-              <div><div class="text-xs text-muted-foreground">Status</div><div class="text-sm">{capture.status.status_str || "-"}</div></div>
-              <div><div class="text-xs text-muted-foreground">Cached nodes</div><div class="text-sm">{capture.status.cached_nodes}</div></div>
-              <div><div class="text-xs text-muted-foreground">Nodes</div><div class="text-sm">{capture.nodes.length}</div></div>
+              <div><div class="text-xs text-muted-foreground">Duration</div><div class="text-sm">{comfyStatus.duration_ms ? formatDuration(comfyStatus.duration_ms) : "-"}</div></div>
+              <div><div class="text-xs text-muted-foreground">Status</div><div class="text-sm">{comfyStatus.status_str || "-"}</div></div>
+              <div><div class="text-xs text-muted-foreground">Cached nodes</div><div class="text-sm">{comfyStatus.cached_nodes}</div></div>
+              <div><div class="text-xs text-muted-foreground">Nodes</div><div class="text-sm">{nodeList.length}</div></div>
             </div>
 
             {#if modelList.length > 0}
@@ -234,7 +241,7 @@
                 <table class="w-full text-xs">
                   <thead><tr class="border-b border-border text-muted-foreground"><th class="px-2 py-1 text-left">ID</th><th class="px-2 py-1 text-left">Type</th><th class="px-2 py-1 text-left">Title</th></tr></thead>
                   <tbody>
-                    {#each capture.nodes as n (n.node_id)}
+                    {#each nodeList as n (n.node_id)}
                       <tr class="border-b border-border last:border-0">
                         <td class="px-2 py-1 font-mono">{n.node_id}</td>
                         <td class="px-2 py-1 font-mono">{n.class_type}</td>
