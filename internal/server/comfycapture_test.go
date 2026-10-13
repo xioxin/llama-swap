@@ -143,3 +143,55 @@ func TestServer_ComfyView_MissingFilename(t *testing.T) {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
 }
+
+// TestServer_ComfyView_WakesColdComfyUI proves a preview request to a cold
+// ComfyUI starts it and holds (via EnsureDirect) instead of returning 502.
+func TestServer_ComfyView_WakesColdComfyUI(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte("PNG!"))
+	}))
+	defer fake.Close()
+
+	local := newStubRouter([]string{config.ComfyUIModelID}, "")
+	// ComfyUI is cold: DirectProcess reports not ready, EnsureDirect starts it.
+	local.notReady = true
+	local.onEnsureDirect = func() { local.notReady = false }
+
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		config.ComfyUIModelID: {Proxy: fake.URL},
+	}}
+	s := newTestServerWithConfig(cfg, local, nil)
+	defer s.store.Close()
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/comfy/view?filename=a.png&type=output", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (woke and held), body=%q", w.Code, w.Body.String())
+	}
+	if local.ensureDirectCalls.Load() != 1 {
+		t.Errorf("EnsureDirect calls = %d, want 1 (cold start)", local.ensureDirectCalls.Load())
+	}
+	if w.Body.String() != "PNG!" {
+		t.Errorf("body = %q", w.Body.String())
+	}
+}
+
+// TestServer_ComfyView_StartFailure proves a request whose wake fails reports
+// 503 rather than a misleading 502.
+func TestServer_ComfyView_StartFailure(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "")
+	local.notReady = true // EnsureDirect will fail (notReady blocks it)
+
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		config.ComfyUIModelID: {Proxy: "http://127.0.0.1:1"},
+	}}
+	s := newTestServerWithConfig(cfg, local, nil)
+	defer s.store.Close()
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/comfy/view?filename=a.png&type=output", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", w.Code)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -37,6 +38,20 @@ func (s *Server) handleAPIComfyView(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 	defer cancel()
+
+	// Wake ComfyUI if it is not running and hold this request until it is
+	// ready, so a preview/download never fails with "unreachable" just because
+	// ComfyUI was cold. EnsureDirect starts into free headroom without evicting
+	// another model (see comfyui.startEvicts), matching a direct passthrough.
+	if s.local != nil {
+		if _, ok := s.local.DirectProcess(config.ComfyUIModelID); !ok {
+			if _, ok := s.local.EnsureDirect(config.ComfyUIModelID, ctx); !ok {
+				swaputil.SendResponse(w, r, http.StatusServiceUnavailable,
+					"comfyui is not loaded and did not start")
+				return
+			}
+		}
+	}
 
 	resp, err := client.View(ctx, q)
 	if err != nil {

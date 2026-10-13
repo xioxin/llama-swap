@@ -192,9 +192,13 @@ Each finished workflow's Capture button opens a ComfyUI capture with three tabs:
 The workflow JSON and metadata are snapshotted into llama-swap when the task
 finishes, so the capture stays viewable even after ComfyUI restarts or clears its
 history. Output media is **not** copied: it stays on ComfyUI and is streamed live
-through `/api/comfy/view`. If ComfyUI is not running, previews show a placeholder
-with a **Load preview** button — clicking it fetches the media then renders the
-image or video, so opening the dialog does not wake ComfyUI on its own.
+through `/api/comfy/view`.
+
+When ComfyUI is already running, previews load immediately. When it is not, each
+preview shows a placeholder with a **Load preview** button: opening the dialog
+does not wake ComfyUI on its own, but clicking the button starts ComfyUI and
+holds the request until it is ready (into free VRAM, without evicting another
+model), then renders the image or video.
 
 ## Request queue visibility
 

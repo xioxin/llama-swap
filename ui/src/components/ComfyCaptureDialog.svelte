@@ -4,6 +4,7 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { copyText } from "../lib/clipboard";
   import { formatDuration } from "../lib/format";
+  import { models } from "../stores/api";
 
   interface Props {
     capture: ComfyCapture | null;
@@ -19,10 +20,25 @@
   type Tab = "outputs" | "workflow" | "details";
   let tab: Tab = $state("outputs");
 
-  // previewState tracks, per output filename, whether the user chose to load
-  // its media. Until then a placeholder is shown so a cold ComfyUI is not hit
-  // by a burst of media requests.
+  // previewLoaded tracks, per output filename, whether to load its media. When
+  // ComfyUI is already running, previews load immediately (no placeholder); a
+  // cold ComfyUI shows a placeholder so opening the dialog does not wake it —
+  // only an explicit click does.
   let previewLoaded = $state<Record<string, boolean>>({});
+
+  // comfyReady mirrors the comfyui_auto process state from the model feed. The
+  // fixed ComfyUI model id is "comfyui_auto".
+  let comfyReady = $derived(
+    ($models ?? []).some((m) => m.id === "comfyui_auto" && m.state === "ready"),
+  );
+
+  // When ComfyUI is (or becomes) running, auto-load every preview.
+  $effect(() => {
+    if (!comfyReady) return;
+    for (const o of capture?.outputs ?? []) {
+      if (previewable(o)) previewLoaded[o.filename] = true;
+    }
+  });
 
   function pretty(v: unknown): string {
     if (v == null) return "";

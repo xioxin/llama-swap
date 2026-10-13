@@ -28,19 +28,21 @@ import (
 
 // stubRouter is a minimal router.LocalRouter for Server dispatch tests.
 type stubRouter struct {
-	models         map[string]bool
-	response       string
-	serveHTTP      func(http.ResponseWriter, *http.Request)
-	shutdownCalls  atomic.Int32
-	running        map[string]process.ProcessState
-	readySince     map[string]time.Time
-	unloadCalls    atomic.Int32
-	unloadModels   []string
-	unloadTimeout  time.Duration
-	loggers        map[string]*logmon.Monitor
-	directProcess  process.Process
-	notReady       bool
-	queuedSnapshot *scheduler.QueueSnapshot
+	models            map[string]bool
+	response          string
+	serveHTTP         func(http.ResponseWriter, *http.Request)
+	shutdownCalls     atomic.Int32
+	running           map[string]process.ProcessState
+	readySince        map[string]time.Time
+	unloadCalls       atomic.Int32
+	unloadModels      []string
+	unloadTimeout     time.Duration
+	loggers           map[string]*logmon.Monitor
+	directProcess     process.Process
+	notReady          bool
+	onEnsureDirect    func()
+	ensureDirectCalls atomic.Int32
+	queuedSnapshot    *scheduler.QueueSnapshot
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -102,6 +104,10 @@ func (s *stubRouter) QueuedSnapshot() scheduler.QueueSnapshot {
 // successful start by returning the adapter whenever the model is registered
 // and not explicitly marked notReady (which stands in for "failed to start").
 func (s *stubRouter) EnsureDirect(modelID string, _ context.Context) (process.Process, bool) {
+	s.ensureDirectCalls.Add(1)
+	if s.onEnsureDirect != nil {
+		s.onEnsureDirect()
+	}
 	if s.notReady {
 		return nil, false
 	}
