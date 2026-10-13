@@ -466,29 +466,6 @@ func (s *Server) handleAPIHardware(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleAPICapture returns the stored request/response capture for a metric ID.
-func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid capture ID")
-		return
-	}
-
-	capture := s.metrics.getCaptureByID(id)
-	if capture == nil {
-		swaputil.SendResponse(w, r, http.StatusNotFound, "capture not found")
-		return
-	}
-
-	jsonBytes, err := json.Marshal(capture)
-	if err != nil {
-		swaputil.SendResponse(w, r, http.StatusInternalServerError, "failed to marshal capture")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(jsonBytes)
-}
-
 // handleAPICancelInflight cancels an active model-dispatched request by its
 // inflight ID. Normal request cleanup removes the row and emits the update.
 func (s *Server) handleAPICancelInflight(w http.ResponseWriter, r *http.Request) {

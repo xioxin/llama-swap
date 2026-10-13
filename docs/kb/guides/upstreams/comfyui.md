@@ -175,6 +175,27 @@ Each submitted workflow also appears as a row in the main Activity table (`model
 state and the row is updated in place when it finishes. A workflow not observed
 within the tracking window is marked `unknown`.
 
+## Capture view
+
+Each finished workflow's Capture button opens a ComfyUI capture with three tabs:
+
+- **Outputs** — every produced file. Images and videos preview inline (via
+  llama-swap's `/api/comfy/view` proxy to ComfyUI); other types (audio, text,
+  3D, unknown) offer download only. Each card shows the filename and, where
+  known, resolution, frame rate, duration and frame count.
+- **Workflow** — the workflow JSON in two forms: the **UI graph** (reopenable in
+  ComfyUI's editor) and the **API graph** (the executable node list). Both can be
+  viewed and downloaded.
+- **Details** — execution status and duration, cached-node count, the node list
+  (class type + title), and the model files used (UNET / VAE / CLIP / LoRA names).
+
+The workflow JSON and metadata are snapshotted into llama-swap when the task
+finishes, so the capture stays viewable even after ComfyUI restarts or clears its
+history. Output media is **not** copied: it stays on ComfyUI and is streamed live
+through `/api/comfy/view`. If ComfyUI is not running, previews show a placeholder
+with a **Load preview** button — clicking it fetches the media then renders the
+image or video, so opening the dialog does not wake ComfyUI on its own.
+
 ## Request queue visibility
 
 The Activity panel also shows a **Request Queue** view: the requests waiting in

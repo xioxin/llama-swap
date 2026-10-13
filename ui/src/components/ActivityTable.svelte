@@ -1,9 +1,10 @@
 <script lang="ts">
-  import type { ActivityLogEntry, InflightRequestEntry, ReqRespCapture } from "../lib/types";
+  import type { ActivityLogEntry, InflightRequestEntry, CaptureEnvelope } from "../lib/types";
   import { cancelInflightRequest, getCapture, uiConfig } from "../stores/api";
   import { persistentStore } from "../stores/persistent";
   import { flip } from "svelte/animate";
   import CaptureDialog from "./CaptureDialog.svelte";
+  import ComfyCaptureDialog from "./ComfyCaptureDialog.svelte";
   import {
     type ColumnDef,
     type SortingState,
@@ -265,7 +266,7 @@
   let inflightOpen = $state($storedInflightOpen);
   let filterOpen = $state($storedFilterOpen);
 
-  let selectedCapture = $state<ReqRespCapture | null>(null);
+  let selectedCapture = $state<CaptureEnvelope | null>(null);
   let dialogOpen = $state(false);
   let exportOpen = $state(false);
   let exportMarkdown = $state("");
@@ -994,6 +995,18 @@
   </Card.Content>
 </Card.Root>
 
-<CaptureDialog capture={selectedCapture} open={dialogOpen} onclose={closeDialog} />
+{#if selectedCapture?.kind === "comfy"}
+    <ComfyCaptureDialog
+      capture={selectedCapture.payload}
+      open={dialogOpen}
+      onclose={closeDialog}
+    />
+  {:else}
+    <CaptureDialog
+      capture={selectedCapture?.kind === "reqresp" ? selectedCapture.payload : null}
+      open={dialogOpen}
+      onclose={closeDialog}
+    />
+  {/if}
 
 <ExportDialog markdown={exportMarkdown} open={exportOpen} onclose={closeExport} />

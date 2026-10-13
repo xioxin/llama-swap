@@ -8,6 +8,8 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/mostlygeek/llama-swap/internal/comfy"
 )
 
 // ReqRespCapture is a stored request/response pair for a single metered request.
@@ -194,4 +196,68 @@ func redactHeaders(headers map[string]string) {
 			headers[key] = "[REDACTED]"
 		}
 	}
+}
+
+// CaptureKind identifies which capture shape a stored entry holds.
+type CaptureKind string
+
+const (
+	CaptureKindReqResp CaptureKind = "reqresp"
+	CaptureKindComfy   CaptureKind = "comfy"
+)
+
+// storedComfyCapture wraps a comfy.Capture for storage so the cache can hold
+// both capture shapes keyed by activity row ID.
+type storedComfyCapture struct {
+	ID      int            `json:"id"`
+	Capture *comfy.Capture `json:"capture"`
+}
+
+// addComfyCapture stores a ComfyUI capture snapshot under its activity row ID.
+// Only the small JSON/metadata snapshot is stored; output media stays on
+// ComfyUI and is proxied live. Returns true when stored.
+func (mp *metricsMonitor) addComfyCapture(id int, capture *comfy.Capture) bool {
+	if mp.captureCache == nil || capture == nil {
+		return false
+	}
+	wrapped := storedComfyCapture{ID: id, Capture: capture}
+	compressed, uncompressed, err := compressComfyCapture(&wrapped)
+	if err != nil {
+		mp.logger.Warnf("failed to compress comfy capture %d: %v", id, err)
+		return false
+	}
+	if err := mp.captureCache.Add(id, compressed); err != nil {
+		mp.logger.Warnf("comfy capture %d too large (%d bytes), skipping: %v", id, len(compressed), err)
+		return false
+	}
+	mp.logger.Debugf("Comfy capture %d saved: %d -> %d bytes", id, uncompressed, len(compressed))
+	return true
+}
+
+// getComfyCaptureByID returns a stored ComfyUI capture, or nil when absent.
+func (mp *metricsMonitor) getComfyCaptureByID(id int) *comfy.Capture {
+	if mp.captureCache == nil {
+		return nil
+	}
+	data, err := mp.captureCache.Get(id)
+	if err != nil {
+		return nil
+	}
+	raw, err := zstdDec.DecodeAll(data, nil)
+	if err != nil {
+		return nil
+	}
+	var wrapped storedComfyCapture
+	if err := cbor.Unmarshal(raw, &wrapped); err != nil {
+		return nil
+	}
+	return wrapped.Capture
+}
+
+func compressComfyCapture(c *storedComfyCapture) ([]byte, int, error) {
+	cborBytes, err := cbor.Marshal(c)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal comfy capture: %w", err)
+	}
+	return zstdEnc.EncodeAll(cborBytes, nil), len(cborBytes), nil
 }

@@ -5,7 +5,6 @@ import type {
   ActivityStatsData,
   VersionInfo,
   APIEventEnvelope,
-  ReqRespCapture,
   InFlightStats,
   InflightRequestEntry,
   PerformanceResponse,
@@ -16,6 +15,7 @@ import type {
   HardwareSnapshot,
   TailcatStatus,
   ComfyJob,
+  CaptureEnvelope,
   QueueSnapshot,
 } from "../lib/types";
 import { appendActivityFilters, type ActivityFilters } from "../lib/activityFilters";
@@ -465,7 +465,7 @@ export async function loadModel(model: string, signal?: AbortSignal): Promise<vo
   }
 }
 
-export async function getCapture(id: number): Promise<ReqRespCapture | null> {
+export async function getCapture(id: number): Promise<CaptureEnvelope | null> {
   try {
     const response = await fetch(`/api/captures/${id}`);
     if (response.status === 404) {

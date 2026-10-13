@@ -28,6 +28,11 @@ const (
 // task-row ReqPath when a real request path is not being recorded.
 const comfyPromptPath = "/prompt"
 
+// comfyViewProxyPath is the llama-swap-relative base that streams ComfyUI output
+// files from the running ComfyUI process. Capture snapshots stamp this on each
+// output so the UI loads media from the same origin.
+const comfyViewProxyPath = "/api/comfy/view"
+
 // comfyPromptPaths are the ComfyUI endpoints that start a workflow. ComfyUI
 // registers every route twice — once bare and once under the /api prefix (see
 // ComfyUI server.py add_routes) — and its web frontend submits to /api/prompt
@@ -176,11 +181,41 @@ func (t *comfyTaskTracker) finalize(row store.ActivityLogEntry, promptID string,
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// Snapshot the finished workflow (workflow graphs, outputs, timing, node
+	// and model list) into the capture store so the Capture view stays usable
+	// after ComfyUI restarts or clears its history. Output media is not stored;
+	// it is proxied from ComfyUI on demand.
+	if status.IsTerminal() {
+		if snap := t.snapshot(ctx, promptID); snap != nil {
+			t.server.metrics.addComfyCapture(row.ID, snap)
+		}
+	}
+
 	if err := t.server.store.Activity().Update(ctx, row); err != nil {
 		t.server.logs.ProxyLogs.Warnf("comfyui: updating activity row %d: %v", row.ID, err)
 		return
 	}
 	t.server.metrics.emitMetric(row)
+}
+
+// snapshot fetches and parses the ComfyUI history record for a prompt and
+// stamps proxy URLs on its outputs. Returns nil when ComfyUI is unreachable or
+// the record is gone — the activity row is still updated without a capture.
+func (t *comfyTaskTracker) snapshot(ctx context.Context, promptID string) *comfy.Capture {
+	client := t.server.comfyClient()
+	if client == nil {
+		return nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cap, err := client.History(cctx, promptID)
+	if err != nil {
+		t.server.logs.ProxyLogs.Debugf("comfyui: capture snapshot for %s unavailable: %v", promptID, err)
+		return nil
+	}
+	cap.SetProxyURLs(comfyViewProxyPath)
+	return cap
 }
 
 // comfyTrackWindow returns how long a workflow is polled before its row is

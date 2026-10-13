@@ -104,6 +104,49 @@ export interface ReqRespCapture {
   resp_body: string; // base64 encoded bytes
 }
 
+export interface ComfyOutput {
+  node_id: string;
+  filename: string;
+  subfolder?: string;
+  type?: string;
+  kind?: string; // image/video/audio/text/3d/file
+  mime?: string;
+  width?: number;
+  height?: number;
+  duration?: number;
+  fps?: number;
+  frame_count?: number;
+  url?: string;
+  download_url?: string;
+}
+
+export interface ComfyNode {
+  node_id: string;
+  class_type: string;
+  title?: string;
+  models?: string[];
+}
+
+export interface ComfyCapture {
+  prompt_id: string;
+  workflow_ui?: unknown;
+  workflow_api?: unknown;
+  status: {
+    status_str: string;
+    completed: boolean;
+    started_at_ms: number;
+    finished_at_ms: number;
+    duration_ms: number;
+    cached_nodes: number;
+  };
+  nodes: ComfyNode[];
+  outputs: ComfyOutput[];
+}
+
+export type CaptureEnvelope =
+  | { kind: "reqresp"; payload: ReqRespCapture }
+  | { kind: "comfy"; payload: ComfyCapture };
+
 export type LogSource = "proxy" | "upstream" | "http";
 
 export interface LogData {
