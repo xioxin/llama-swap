@@ -851,6 +851,11 @@
                     "minimum": 0,
                     "default": 0,
                     "description": "Maximum seconds a workflow submit (POST /prompt) waits in llama-swap's queue for the GPU before it is rejected with 503. 0 (default) waits indefinitely. Bounds the request so a submit cannot hang forever behind a stuck model swap."
+                },
+                "startEvicts": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Whether starting ComfyUI may evict other mutually exclusive models to make room. ComfyUI needs only a small headroom (~500-700MiB) to start, so by default (false) it starts into free VRAM and never unloads a running model. Set true only if a start must reclaim a sibling's GPU when headroom is insufficient."
                 }
             },
             "additionalProperties": false,

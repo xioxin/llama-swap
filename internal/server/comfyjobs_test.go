@@ -65,3 +65,42 @@ func TestServer_ComfyJobs_LiveAndTerminal(t *testing.T) {
 		t.Errorf("status = %q, want completed", job.Status)
 	}
 }
+
+// TestServer_ComfyJobs_LiveTupleJob proves the panel surfaces a live ComfyUI
+// prompt from the real tuple-shaped /queue response.
+func TestServer_ComfyJobs_LiveTupleJob(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusRunning)
+	defer fc.close()
+	fc.liveQueue = `{"queue_running":[[1,"live-run",{}, {}, []]],"queue_pending":[[2,"live-pend",{}, {}, []]]}`
+
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	}
+	s := newTestServerWithConfig(cfg, nil, nil)
+	defer s.store.Close()
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/comfy/jobs", nil))
+
+	var payload struct {
+		Jobs []comfyJobView `json:"jobs"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Jobs) != 2 {
+		t.Fatalf("jobs = %d, want 2 (live running + queued)", len(payload.Jobs))
+	}
+	byID := map[string]comfyJobView{}
+	for _, j := range payload.Jobs {
+		byID[j.PromptID] = j
+	}
+	if j, ok := byID["live-run"]; !ok || j.Status != "running" || !j.Live {
+		t.Errorf("live-run = %+v, want running live", byID["live-run"])
+	}
+	if j, ok := byID["live-pend"]; !ok || j.Status != "queued" || !j.Live {
+		t.Errorf("live-pend = %+v, want queued live", byID["live-pend"])
+	}
+}

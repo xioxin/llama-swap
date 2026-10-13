@@ -66,6 +66,7 @@ type baseRouter struct {
 	unloadCh    chan unloadReq
 	swapDoneCh  chan scheduler.SwapDone
 	serveDoneCh chan scheduler.ServeDoneEvent
+	snapCh      chan chan scheduler.QueueSnapshot
 
 	runDone chan struct{}
 
@@ -101,6 +102,7 @@ func newBaseRouter(
 		unloadCh:    make(chan unloadReq),
 		swapDoneCh:  make(chan scheduler.SwapDone),
 		serveDoneCh: make(chan scheduler.ServeDoneEvent),
+		snapCh:      make(chan chan scheduler.QueueSnapshot),
 		runDone:     make(chan struct{}),
 	}
 	sched, err := scheduler.New(conf, name, logger, planner, b)
@@ -159,6 +161,9 @@ func (b *baseRouter) run() {
 
 		case ev := <-b.serveDoneCh:
 			b.schedule.OnServeDone(ev)
+
+		case respCh := <-b.snapCh:
+			respCh <- b.schedule.QueuedSnapshot()
 		}
 	}
 }
@@ -458,6 +463,44 @@ func (b *baseRouter) DirectProcess(modelID string) (process.Process, bool) {
 	return p, true
 }
 
+// EnsureDirect brings a model to ready and returns its process, WITHOUT
+// evicting any other model. It is the start-and-hold path for requests that may
+// wake a model (ComfyUI direct reads) but must never swap another model out:
+// the caller's context bounds the wait, and the process is started into whatever
+// headroom exists rather than by reclaiming a sibling's GPU. Returns false when
+// the model is unknown or did not become ready in time.
+func (b *baseRouter) EnsureDirect(modelID string, ctx context.Context) (process.Process, bool) {
+	p, ok := b.processes[modelID]
+	if !ok {
+		return nil, false
+	}
+	if p.State() == process.StateReady {
+		return p, true
+	}
+	if err := p.EnsureReady(ctx, b.healthCheckTimeout()); err != nil {
+		return nil, false
+	}
+	return p, p.State() == process.StateReady
+}
+
+// QueuedSnapshot returns the scheduler's queue view via the run loop, so it is
+// serialized with every other scheduler mutation. It is the read-only backing
+// for the queue-visibility API.
+func (b *baseRouter) QueuedSnapshot() scheduler.QueueSnapshot {
+	respCh := make(chan scheduler.QueueSnapshot, 1)
+	select {
+	case b.snapCh <- respCh:
+	case <-b.runDone:
+		return scheduler.QueueSnapshot{Queued: []scheduler.QueuedRequest{}}
+	}
+	select {
+	case snap := <-respCh:
+		return snap
+	case <-b.runDone:
+		return scheduler.QueueSnapshot{Queued: []scheduler.QueuedRequest{}}
+	}
+}
+
 // RunningModels returns the current state of every process that is not stopped
 // or shut down. The processes map keys are fixed at construction and State()
 // is a snapshot, so this is safe to call without the run loop.
@@ -593,8 +636,10 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	hr := scheduler.HandlerReq{
-		Model: data.ModelID,
-		Ctx:   req.Context(),
+		Model:      data.ModelID,
+		Path:       req.URL.Path,
+		EnqueuedAt: time.Now(),
+		Ctx:        req.Context(),
 		// Unbuffered: a successful send on Respond proves the waiter is
 		// alive and consuming. grant() relies on this to avoid handing a
 		// handleFunc to a cancelled waiter and leaking the inFlight count.

@@ -16,6 +16,7 @@ import type {
   HardwareSnapshot,
   TailcatStatus,
   ComfyJob,
+  QueueSnapshot,
 } from "../lib/types";
 import { appendActivityFilters, type ActivityFilters } from "../lib/activityFilters";
 import { connectionState } from "./theme";
@@ -383,6 +384,14 @@ export async function getActivityStats(model?: string): Promise<ActivityStatsDat
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch activity stats: ${response.status}`);
+  }
+  return await response.json();
+}
+
+export async function getQueue(): Promise<QueueSnapshot> {
+  const response = await fetch("/api/queue");
+  if (!response.ok) {
+    throw new Error(`Failed to fetch queue: ${response.status}`);
   }
   return await response.json();
 }

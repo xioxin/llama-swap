@@ -946,3 +946,39 @@ func TestFIFO_ConcurrencyLimit_CancelledQueuedWaiterReleasesReservation(t *testi
 		t.Fatalf("queue len=%d want 1 after cancel and retry", got)
 	}
 }
+
+// TestFIFO_QueuedSnapshot proves the queue snapshot reports queued models in
+// order with positions and the head as the next swap target.
+func TestFIFO_QueuedSnapshot(t *testing.T) {
+	eff := newFakeEffects()
+	eff.states["a"] = process.StateStopped
+	eff.states["b"] = process.StateStopped
+	// Loading b evicts a. a starts first (in-flight swap), so b collides and queues.
+	s := newFIFO(&stubPlanner{evict: map[string][]string{"b": {"a"}}}, eff)
+
+	s.OnRequest(req("a")) // StartSwap(a)
+
+	rb := reqCh("b")
+	rb.Path = "/v1/chat/completions"
+	rb.EnqueuedAt = time.Now().Add(-2 * time.Second)
+	s.OnRequest(rb) // collides with a's swap -> queued
+
+	rc := reqCh("b")
+	rc.Path = "/v1/models"
+	rc.EnqueuedAt = time.Now().Add(-time.Second)
+	s.OnRequest(rc) // queued behind rb
+
+	snap := s.QueuedSnapshot()
+	if len(snap.Queued) != 2 {
+		t.Fatalf("queued = %d, want 2", len(snap.Queued))
+	}
+	if snap.NextModel != "b" {
+		t.Errorf("NextModel = %q, want b", snap.NextModel)
+	}
+	if snap.Queued[0].Position != 1 || snap.Queued[0].Path != "/v1/chat/completions" || !snap.Queued[0].NextSwapFor {
+		t.Errorf("head = %+v, want pos 1 /v1/chat/completions next", snap.Queued[0])
+	}
+	if snap.Queued[1].Position != 2 || snap.Queued[1].Path != "/v1/models" || snap.Queued[1].NextSwapFor {
+		t.Errorf("second = %+v, want pos 2 /v1/models not next", snap.Queued[1])
+	}
+}

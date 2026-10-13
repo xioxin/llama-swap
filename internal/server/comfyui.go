@@ -66,7 +66,7 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 	escapedRemaining := swaputil.EscapedPathSuffix(r.URL.EscapedPath(), "/comfyui")
 	r.URL.Path = remainingPath
 	r.URL.RawPath = escapedRemaining
-	s.serveComfyUI(w, r)
+	s.serveComfyUI(w, r, false)
 }
 
 // serveComfyUI proxies a request to the fixed local ComfyUI model and serves
@@ -76,21 +76,10 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 //
 // Both surfaces share the same start gating: while the model is not loaded, a
 // GET to an ignored path cannot start it (see comfyUIIgnoresPath).
-func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request) {
+func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request, dedicated bool) {
 	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
 		return
-	}
-
-	// Only a GET is ignored. A write is a deliberate action even on an ignored
-	// path, so queueing a job still starts the model.
-	if r.Method == http.MethodGet && comfyUIIgnoresPath(r.URL.Path) {
-		state, ok := s.local.RunningModels()[config.ComfyUIModelID]
-		if !ok || state != process.StateReady {
-			swaputil.SendResponse(w, r, http.StatusConflict,
-				"model "+config.ComfyUIModelID+" is not loaded; ignored ComfyUI paths cannot start it")
-			return
-		}
 	}
 
 	*r = *r.WithContext(swaputil.SetContext(r.Context(), swaputil.ReqContextData{
@@ -100,41 +89,73 @@ func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request) {
 		Metadata: make(map[string]string),
 	}))
 
-	// Read-only queries and control calls (queue/history/jobs/view/interrupt/
-	// free/cancel) must stay responsive while a swap is in flight, so they are
-	// served straight to the running process — no queue, no swap wait. This is
-	// what keeps the ComfyUI UI alive during a model swap. A workflow submit
-	// (POST /prompt) is the one request that queues and is tracked.
-	if isComfyPassthrough(r) {
+	// Direct (non-submit) requests are served to ComfyUI without ever evicting
+	// another model: they may START ComfyUI into available headroom and hold the
+	// request until it is ready, but they must never swap a running LLM out. That
+	// is what stops a history panel poll or a settings write from unloading a
+	// model. Only POST /prompt (below) may swap.
+	if isComfyDirect(r) {
+		// Start gating: on the /comfyui/ surface an ignored-path GET may not
+		// start the model (kept from the passthrough rules). The dedicated port
+		// cold-starts freely on any request.
+		if !dedicated && r.Method == http.MethodGet && comfyUIIgnoresPath(r.URL.Path) {
+			if p, ok := s.local.DirectProcess(config.ComfyUIModelID); ok {
+				p.ServeHTTP(w, r)
+				return
+			}
+			swaputil.SendResponse(w, r, http.StatusConflict,
+				"model "+config.ComfyUIModelID+" is not loaded; ignored ComfyUI paths cannot start it")
+			return
+		}
+		// Serve directly when already running. When not running, start it: by
+		// default into free headroom without evicting (EnsureDirect); with
+		// comfyui.startEvicts, through the scheduler which may reclaim a
+		// sibling model's GPU if headroom is insufficient.
 		if p, ok := s.local.DirectProcess(config.ComfyUIModelID); ok {
 			p.ServeHTTP(w, r)
 			return
 		}
-		// Not ready: fall through to the scheduler so the request starts the
-		// model when allowed (writes), or is gated (ignored-path GETs above).
-	}
-
-	if isComfyPromptSubmit(r) {
-		// Bound how long a submit may sit in the swap queue. On timeout the
-		// request context is cancelled, which prunes the queued entry and lets
-		// the client retry instead of hanging forever behind a stuck swap.
-		if wait := s.cfg.ComfyUI.QueueWait(); wait > 0 {
-			ctx, cancel := context.WithTimeout(r.Context(), wait)
-			defer cancel()
-			r = r.WithContext(ctx)
-		}
-		recorder := wrapComfySubmit(w)
-		s.local.ServeHTTP(recorder, r)
-		if !recorder.WroteHeader() {
-			// The queue wait timed out (or the client left) before the request
-			// reached ComfyUI: report 503 so the submit is visibly rejected
-			// rather than leaving the connection to hang.
-			swaputil.SendResponse(w, r, http.StatusServiceUnavailable,
-				"comfyui: workflow submit timed out waiting for the queue")
+		if s.cfg.ComfyUI != nil && s.cfg.ComfyUI.StartEvicts {
+			s.local.ServeHTTP(w, r) // scheduler may swap to make room
 			return
 		}
-		recordComfySubmit(s, r, recorder)
+		if p, ok := s.local.EnsureDirect(config.ComfyUIModelID, r.Context()); ok {
+			p.ServeHTTP(w, r)
+			return
+		}
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable,
+			"model "+config.ComfyUIModelID+" is not loaded and did not start")
 		return
 	}
-	s.local.ServeHTTP(w, r)
+
+	// POST /prompt: the one request that queues for the GPU and swaps. A GET to
+	// an ignored path never starts the model (kept from the passthrough rules).
+	if r.Method == http.MethodGet && comfyUIIgnoresPath(r.URL.Path) {
+		state, ok := s.local.RunningModels()[config.ComfyUIModelID]
+		if !ok || state != process.StateReady {
+			swaputil.SendResponse(w, r, http.StatusConflict,
+				"model "+config.ComfyUIModelID+" is not loaded; ignored ComfyUI paths cannot start it")
+			return
+		}
+	}
+
+	// Bound how long a submit may sit in the swap queue. On timeout the request
+	// context is cancelled, which prunes the queued entry and lets the client
+	// retry instead of hanging forever behind a stuck swap.
+	if wait := s.cfg.ComfyUI.QueueWait(); wait > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), wait)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
+	recorder := wrapComfySubmit(w)
+	s.local.ServeHTTP(recorder, r)
+	if !recorder.WroteHeader() {
+		// The queue wait timed out (or the client left) before the request
+		// reached ComfyUI: report 503 so the submit is visibly rejected rather
+		// than leaving the connection to hang.
+		swaputil.SendResponse(w, r, http.StatusServiceUnavailable,
+			"comfyui: workflow submit timed out waiting for the queue")
+		return
+	}
+	recordComfySubmit(s, r, recorder)
 }

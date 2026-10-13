@@ -275,11 +275,12 @@ func TestServer_ServeComfyUIPort(t *testing.T) {
 		}
 	})
 
-	t.Run("unloaded model ignores only GETs to ignored paths", func(t *testing.T) {
+	t.Run("dedicated port starts on any request when unloaded", func(t *testing.T) {
 		local.running = nil
 
-		// Paths outside the ignore list, and any write, may start the model —
-		// the same rule /comfyui/ applies, so both surfaces share the gate.
+		// The dedicated comfyui.port cold-starts ComfyUI on ANY request —
+		// reads, assets, websockets, writes alike — and never applies the
+		// /comfyui/ ignored-path gate. It also never swaps another model out.
 		for _, tt := range []struct {
 			name   string
 			method string
@@ -287,12 +288,11 @@ func TestServer_ServeComfyUIPort(t *testing.T) {
 		}{
 			{name: "api path", method: http.MethodGet, target: "/api/prompt"},
 			{name: "html asset", method: http.MethodGet, target: "/index.html"},
-			{name: "ws name prefix", method: http.MethodGet, target: "/wsapi"},
-			{name: "jobs sub path", method: http.MethodGet, target: "/api/jobs/12"},
+			{name: "ws", method: http.MethodGet, target: "/ws"},
+			{name: "ws sub path", method: http.MethodGet, target: "/ws/sub/path?a=1"},
+			{name: "jobs", method: http.MethodGet, target: "/api/jobs"},
+			{name: "settings write", method: http.MethodPost, target: "/api/settings/Comfy.Queue.History.Expanded"},
 			{name: "non-GET ws", method: http.MethodPost, target: "/ws"},
-			{name: "non-GET ws sub path", method: http.MethodPost, target: "/ws/sub"},
-			{name: "non-GET jobs", method: http.MethodPost, target: "/api/jobs"},
-			{name: "non-GET asset", method: http.MethodPost, target: "/assets/app.js"},
 		} {
 			before := serveCalls
 			w := httptest.NewRecorder()
@@ -301,42 +301,7 @@ func TestServer_ServeComfyUIPort(t *testing.T) {
 				t.Errorf("%s status=%d want 200 body=%q", tt.name, w.Code, w.Body.String())
 			}
 			if serveCalls != before+1 {
-				t.Errorf("%s did not reach the model router", tt.name)
-			}
-		}
-
-		// /ws matches as a path prefix, so sub paths and query parameters
-		// are ignored the same way. Static assets and /api/jobs come from
-		// the same list the /upstream equivalent is configured with.
-		targets := []string{
-			"/ws",
-			"/ws?clientId=abc123",
-			"/ws/",
-			"/ws/sub/path?a=1",
-			"/api/jobs",
-			"/api/jobs?open=1",
-			"/assets/app.js",
-			"/user/workflow.json",
-			"/style.css",
-		}
-		for _, state := range []map[string]process.ProcessState{
-			nil,
-			{config.ComfyUIModelID: process.StateStarting},
-		} {
-			local.running = state
-			for _, target := range targets {
-				before := serveCalls
-				w := httptest.NewRecorder()
-				s.ServeComfyUIPort(w, httptest.NewRequest(http.MethodGet, target, nil))
-				if w.Code != http.StatusConflict {
-					t.Fatalf("%s status=%d want 409 body=%q running=%v", target, w.Code, w.Body.String(), state)
-				}
-				if serveCalls != before {
-					t.Fatalf("unready model received %s, running=%v", target, state)
-				}
-				if !strings.Contains(w.Body.String(), "ignored ComfyUI paths cannot start it") {
-					t.Errorf("%s body=%q missing ignored-path explanation", target, w.Body.String())
-				}
+				t.Errorf("%s did not reach the model process", tt.name)
 			}
 		}
 	})
@@ -345,7 +310,7 @@ func TestServer_ServeComfyUIPort(t *testing.T) {
 		local.running = map[string]process.ProcessState{config.ComfyUIModelID: process.StateReady}
 		before := serveCalls
 		w := httptest.NewRecorder()
-		s.ServeComfyUIPort(w, httptest.NewRequest(http.MethodGet, "/ws", nil))
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/comfyui/ws", nil))
 		if w.Code != http.StatusOK {
 			t.Fatalf("status=%d want 200 body=%q", w.Code, w.Body.String())
 		}
@@ -364,25 +329,25 @@ func TestServer_ServeComfyUIPort(t *testing.T) {
 		}{
 			{
 				name:      "encoded slash",
-				target:    "/api/userdata/workflows%2Fexample.json?preview=1",
+				target:    "/comfyui/api/userdata/workflows%2Fexample.json?preview=1",
 				wantPath:  "/api/userdata/workflows%2Fexample.json",
 				wantQuery: "preview=1",
 			},
 			{
 				name:     "double encoded slash",
-				target:   "/api/userdata/workflows%252Fexample.json",
+				target:   "/comfyui/api/userdata/workflows%252Fexample.json",
 				wantPath: "/api/userdata/workflows%252Fexample.json",
 			},
 			{
 				name:     "utf8 and encoded slash",
-				target:   "/api/%E2%9C%93%2Ffile.json",
+				target:   "/comfyui/api/%E2%9C%93%2Ffile.json",
 				wantPath: "/api/%E2%9C%93%2Ffile.json",
 			},
 		} {
 			t.Run(tt.name, func(t *testing.T) {
 				w := httptest.NewRecorder()
 				req := httptest.NewRequest(http.MethodPost, tt.target, nil)
-				s.ServeComfyUIPort(w, req)
+				s.ServeHTTP(w, req)
 				if w.Code != http.StatusOK {
 					t.Fatalf("status=%d body=%q", w.Code, w.Body.String())
 				}

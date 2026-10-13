@@ -60,6 +60,13 @@ type ComfyUIConfig struct {
 	// 0 (the default) waits indefinitely. It bounds the request so a submit
 	// can never hang forever behind a stuck model swap.
 	QueueTimeout int `yaml:"queueTimeout"`
+
+	// StartEvicts controls whether starting ComfyUI may evict other mutually
+	// exclusive models to make room. ComfyUI needs only a small headroom
+	// (~500-700MiB) when it starts, so by default (false) a start fits into
+	// free VRAM and never unloads a running model. Set true only if a start
+	// must reclaim a sibling model's GPU when headroom is insufficient.
+	StartEvicts bool `yaml:"startEvicts"`
 }
 
 // QueueWait returns the maximum wait for a queued workflow submit. A nil

@@ -1,11 +1,13 @@
 package router
 
 import (
+	"context"
 	"net/http"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -62,4 +64,14 @@ type LocalRouter interface {
 	// serve a request straight to it, bypassing the scheduler's swap/queue
 	// machinery. Returns false when the model is unknown or not ready.
 	DirectProcess(modelID string) (process.Process, bool)
+
+	// EnsureDirect brings a model to ready without evicting any other model,
+	// then returns its process. It is the start-and-hold path for requests that
+	// may wake a model but must never swap another out. Returns false when the
+	// model is unknown or does not become ready in time.
+	EnsureDirect(modelID string, ctx context.Context) (process.Process, bool)
+
+	// QueuedSnapshot returns an ordered, read-only view of the scheduler's
+	// request queue and the model the head would swap in next.
+	QueuedSnapshot() scheduler.QueueSnapshot
 }

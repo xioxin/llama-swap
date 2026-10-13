@@ -163,3 +163,17 @@ func TestConfig_ComfyUIQueueTimeout_Negative(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "comfyui.queueTimeout")
 }
+
+func TestConfig_ComfyUIStartEvicts_Default(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  swapMode: cleanup\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.False(t, cfg.ComfyUI.StartEvicts)
+}
+
+func TestConfig_ComfyUIStartEvicts_True(t *testing.T) {
+	cfg, err := LoadConfigFromReader(strings.NewReader(plainModel + "comfyui:\n  startEvicts: true\n"))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ComfyUI)
+	assert.True(t, cfg.ComfyUI.StartEvicts)
+}

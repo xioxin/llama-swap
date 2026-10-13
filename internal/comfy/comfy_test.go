@@ -2,6 +2,7 @@ package comfy
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -387,6 +388,55 @@ func TestComfy_JobStatus_IsTerminal(t *testing.T) {
 	for st, want := range cases {
 		if got := st.IsTerminal(); got != want {
 			t.Errorf("IsTerminal(%q) = %v, want %v", st, got, want)
+		}
+	}
+}
+
+// TestComfy_QueueTupleShape locks the real ComfyUI /queue format: queue items
+// are tuples (number, prompt_id, prompt, extra_data, outputs), so the prompt id
+// is at index 1 — not a "prompt_id" object field.
+func TestComfy_QueueTupleShape(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.queueJSON = `{"queue_running":[[1,"run-1",{}, {}, []]],"queue_pending":[[2,"pend-1",{}, {}, []],[3,"pend-2",{}, {}, []]]}`
+
+	jobs, err := f.client().Jobs(context.Background())
+	if err != nil {
+		t.Fatalf("Jobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("Jobs = %d, want 3", len(jobs))
+	}
+	byID := map[string]JobStatus{}
+	for _, j := range jobs {
+		byID[j.PromptID] = j.Status
+	}
+	if byID["run-1"] != StatusRunning {
+		t.Errorf("run-1 = %q, want running", byID["run-1"])
+	}
+	if byID["pend-1"] != StatusQueued || byID["pend-2"] != StatusQueued {
+		t.Errorf("pending = %q,%q, want queued,queued", byID["pend-1"], byID["pend-2"])
+	}
+
+	// JobState must also see the tuple ids.
+	if got, err := f.client().JobState(context.Background(), "run-1"); err != nil || got != StatusRunning {
+		t.Errorf("JobState(run-1) = %q,%v, want running", got, err)
+	}
+	if got, err := f.client().JobState(context.Background(), "pend-2"); err != nil || got != StatusQueued {
+		t.Errorf("JobState(pend-2) = %q,%v, want queued", got, err)
+	}
+}
+
+func TestComfy_PromptIDFromQueueItem(t *testing.T) {
+	cases := map[string]string{
+		`[1,"abc",{}, {}, []]`: "abc",
+		`{"prompt_id":"xyz"}`:  "xyz",
+		`[1]`:                  "",
+		`"garbage"`:            "",
+	}
+	for raw, want := range cases {
+		if got := promptIDFromQueueItem(json.RawMessage(raw)); got != want {
+			t.Errorf("promptIDFromQueueItem(%s) = %q, want %q", raw, got, want)
 		}
 	}
 }

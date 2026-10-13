@@ -278,6 +278,31 @@ func (s *FIFO) OnShutdown(err error) {
 	}
 }
 
+// QueuedSnapshot returns an ordered read-only view of the queue and the model
+// the head request would swap in next. It runs on the run-loop goroutine.
+func (s *FIFO) QueuedSnapshot() QueueSnapshot {
+	now := time.Now()
+	snap := QueueSnapshot{Queued: make([]QueuedRequest, 0, len(s.queued))}
+	for i, q := range s.queued {
+		waiting := now.Sub(q.EnqueuedAt).Milliseconds()
+		if waiting < 0 {
+			waiting = 0
+		}
+		snap.Queued = append(snap.Queued, QueuedRequest{
+			Model:       q.Model,
+			Path:        q.Path,
+			EnqueuedAt:  q.EnqueuedAt,
+			WaitingMs:   waiting,
+			Position:    i + 1,
+			NextSwapFor: i == 0,
+		})
+	}
+	if len(s.queued) > 0 {
+		snap.NextModel = s.queued[0].Model
+	}
+	return snap
+}
+
 // grantHandler hands the caller a tracked handler for modelID and, only if the
 // caller was still there to receive it, bumps the in-flight count. Incrementing
 // when the grant failed would strand the counter and block future evictions.

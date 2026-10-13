@@ -20,6 +20,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
@@ -27,17 +28,19 @@ import (
 
 // stubRouter is a minimal router.LocalRouter for Server dispatch tests.
 type stubRouter struct {
-	models        map[string]bool
-	response      string
-	serveHTTP     func(http.ResponseWriter, *http.Request)
-	shutdownCalls atomic.Int32
-	running       map[string]process.ProcessState
-	readySince    map[string]time.Time
-	unloadCalls   atomic.Int32
-	unloadModels  []string
-	unloadTimeout time.Duration
-	loggers       map[string]*logmon.Monitor
-	directProcess process.Process
+	models         map[string]bool
+	response       string
+	serveHTTP      func(http.ResponseWriter, *http.Request)
+	shutdownCalls  atomic.Int32
+	running        map[string]process.ProcessState
+	readySince     map[string]time.Time
+	unloadCalls    atomic.Int32
+	unloadModels   []string
+	unloadTimeout  time.Duration
+	loggers        map[string]*logmon.Monitor
+	directProcess  process.Process
+	notReady       bool
+	queuedSnapshot *scheduler.QueueSnapshot
 }
 
 func newStubRouter(models []string, response string) *stubRouter {
@@ -82,13 +85,65 @@ func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 }
 
 // directProcess, when set, backs DirectProcess so passthrough-serving tests can
-// supply a fake process. Unset means "not ready" and the router falls back to
-// the scheduler path.
+// supply a fake process. When unset but the model is registered, a default
+// adapter forwards to serveHTTP: in the stub, DirectProcess and ServeHTTP both
+// stand for "the model process", so legacy routing tests keep working. Set
+// directProcess explicitly (e.g. to a fake that records calls) to prove a
+// request bypasses the scheduler entirely.
+// QueuedSnapshot returns an empty queue unless a test preloads one.
+func (s *stubRouter) QueuedSnapshot() scheduler.QueueSnapshot {
+	if s.queuedSnapshot != nil {
+		return *s.queuedSnapshot
+	}
+	return scheduler.QueueSnapshot{Queued: []scheduler.QueuedRequest{}}
+}
+
+// EnsureDirect starts-and-holds without evicting. In the stub it simulates a
+// successful start by returning the adapter whenever the model is registered
+// and not explicitly marked notReady (which stands in for "failed to start").
+func (s *stubRouter) EnsureDirect(modelID string, _ context.Context) (process.Process, bool) {
+	if s.notReady {
+		return nil, false
+	}
+	if !s.models[modelID] {
+		return nil, false
+	}
+	return &stubDirectProcess{router: s}, true
+}
+
 func (s *stubRouter) DirectProcess(modelID string) (process.Process, bool) {
+	if s.notReady {
+		return nil, false
+	}
 	if s.directProcess != nil {
 		return s.directProcess, true
 	}
-	return nil, false
+	if !s.models[modelID] {
+		return nil, false
+	}
+	// Mirror the real router: DirectProcess only serves a ready model. A nil or
+	// absent running entry means the model is not running.
+	if st, ok := s.running[modelID]; !ok || st != process.StateReady {
+		return nil, false
+	}
+	return &stubDirectProcess{router: s}, true
+}
+
+// stubDirectProcess adapts a stubRouter's serveHTTP into a process.Process so
+// DirectProcess can forward to it.
+type stubDirectProcess struct{ router *stubRouter }
+
+func (p *stubDirectProcess) Run(time.Duration) error         { return nil }
+func (p *stubDirectProcess) WaitReady(context.Context) error { return nil }
+func (p *stubDirectProcess) EnsureReady(context.Context, time.Duration) error {
+	return nil
+}
+func (p *stubDirectProcess) Stop(time.Duration) error    { return nil }
+func (p *stubDirectProcess) State() process.ProcessState { return process.StateReady }
+func (p *stubDirectProcess) Status() process.Status      { return process.Status{State: process.StateReady} }
+func (p *stubDirectProcess) Logger() *logmon.Monitor     { return nil }
+func (p *stubDirectProcess) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.router.ServeHTTP(w, r)
 }
 
 // newTestServer wires a Server with stub routers and a built mux.

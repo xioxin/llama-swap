@@ -19,14 +19,19 @@ import (
 // fakeComfyUpstream is a minimal ComfyUI stand-in whose job state can be set
 // per test to drive terminal-status backfill.
 type fakeComfyUpstream struct {
-	srv    *httptest.Server
-	status comfy.JobStatus
+	srv       *httptest.Server
+	status    comfy.JobStatus
+	liveQueue string
 }
 
 func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 	f := &fakeComfyUpstream{status: status}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
+		if f.liveQueue != "" {
+			_, _ = w.Write([]byte(f.liveQueue))
+			return
+		}
 		// Never in the queue: terminal state is read from /history.
 		_, _ = w.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
 	})
@@ -205,10 +210,13 @@ func (f *fakeDirectProcess) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(f.response))
 }
 
-// TestComfy_PassthroughClassification proves only workflow submits queue; every
-// read and control call is a passthrough that must not wait behind a swap.
-func TestComfy_PassthroughClassification(t *testing.T) {
-	passthrough := []struct{ method, path string }{
+// TestComfy_DirectClassification proves only a workflow submit (POST /prompt)
+// is treated as swappable work; every other ComfyUI request is direct and must
+// never trigger a swap. This includes settings writes like the frontend's
+// POST /api/settings/... which previously fell through to the scheduler and
+// unloaded a running LLM.
+func TestComfy_DirectClassification(t *testing.T) {
+	direct := []struct{ method, path string }{
 		{http.MethodGet, "/queue"},
 		{http.MethodGet, "/history/abc"},
 		{http.MethodGet, "/api/jobs"},
@@ -219,36 +227,116 @@ func TestComfy_PassthroughClassification(t *testing.T) {
 		{http.MethodPost, "/free"},
 		{http.MethodPost, "/api/jobs/abc/cancel"},
 		{http.MethodPost, "/api/jobs/cancel"},
+		{http.MethodPost, "/api/settings/Comfy.Queue.History.Expanded"},
+		{http.MethodPost, "/upload/image"},
+		{http.MethodPost, "/history"},
+		{http.MethodDelete, "/history"},
 	}
-	for _, c := range passthrough {
+	for _, c := range direct {
 		r := httptest.NewRequest(c.method, c.path, nil)
-		if !isComfyPassthrough(r) {
-			t.Errorf("isComfyPassthrough(%s %s) = false, want true", c.method, c.path)
+		if !isComfyDirect(r) {
+			t.Errorf("isComfyDirect(%s %s) = false, want true (must not swap)", c.method, c.path)
+		}
+		if isComfyPromptSubmit(r) {
+			t.Errorf("isComfyPromptSubmit(%s %s) = true, want false", c.method, c.path)
 		}
 	}
-	// Only the workflow submit queues.
+	// Only the workflow submit is swappable work.
 	submit := httptest.NewRequest(http.MethodPost, "/prompt", nil)
-	if isComfyPassthrough(submit) {
-		t.Errorf("isComfyPassthrough(POST /prompt) = true, want false (it queues)")
+	if isComfyDirect(submit) {
+		t.Errorf("isComfyDirect(POST /prompt) = true, want false (it is the only swapper)")
 	}
 }
 
-// TestServer_ComfyPassthrough_BypassesQueue proves a read request is served
-// straight to the ready process (DirectProcess) rather than the scheduler.
-func TestServer_ComfyPassthrough_BypassesQueue(t *testing.T) {
-	proc := &fakeDirectProcess{response: `{"queue_running":[],"queue_pending":[]}`}
+// TestServer_ComfyDirect_NeverSwaps is the regression guard for the spurious
+// swap: a non-submit request (e.g. a settings write from the ComfyUI UI) must
+// be served straight to the ready process and must NOT reach the scheduler,
+// so it can never evict a running LLM.
+func TestServer_ComfyDirect_NeverSwaps(t *testing.T) {
+	proc := &fakeDirectProcess{response: `{}`}
 	local := newStubRouter([]string{config.ComfyUIModelID}, "")
 	local.directProcess = proc
+	// If the scheduler were reached, serveHTTP would fire. It must not.
+	schedulerReached := false
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		schedulerReached = true
+		w.WriteHeader(http.StatusOK)
+	}
+
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+
+	for _, req := range []*http.Request{
+		httptest.NewRequest(http.MethodPost, "/comfyui/api/settings/Comfy.Queue.History.Expanded", strings.NewReader("true")),
+		httptest.NewRequest(http.MethodGet, "/comfyui/history", nil),
+		httptest.NewRequest(http.MethodGet, "/comfyui/view", nil),
+		httptest.NewRequest(http.MethodPost, "/comfyui/interrupt", nil),
+	} {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, req)
+	}
+
+	if schedulerReached {
+		t.Errorf("a direct ComfyUI request reached the scheduler; it must never swap")
+	}
+	if got := proc.serveCalls.Load(); got != 4 {
+		t.Errorf("direct ServeHTTP calls = %d, want 4", got)
+	}
+}
+
+// TestServer_ComfyDirect_StartsWithoutSwapping proves a direct request to a
+// ComfyUI that is not yet running starts it and holds (or reports 503 if the
+// start fails) WITHOUT ever reaching the scheduler — so it can never evict a
+// running LLM.
+func TestServer_ComfyDirect_StartsWithoutSwapping(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "")
+	local.notReady = true // start will fail
+	schedulerReached := false
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		schedulerReached = true
+		w.WriteHeader(http.StatusOK)
+	}
 
 	s := newTestServer(local, newStubRouter(nil, ""))
 	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
 	s.routes()
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodGet, "/comfyui/queue", nil)
-	s.ServeHTTP(w, r)
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/comfyui/history", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 (start failed)", w.Code)
+	}
+	if schedulerReached {
+		t.Errorf("a direct request reached the scheduler; it must never swap")
+	}
+}
 
-	if got := proc.serveCalls.Load(); got != 1 {
-		t.Errorf("direct ServeHTTP calls = %d, want 1 (passthrough bypasses queue)", got)
+// TestServer_ComfyDirect_StartHoldsWhenCold proves a cold direct request starts
+// ComfyUI and serves the request, still without reaching the scheduler.
+func TestServer_ComfyDirect_StartHoldsWhenCold(t *testing.T) {
+	proc := &fakeDirectProcess{response: `{}`}
+	local := newStubRouter([]string{config.ComfyUIModelID}, "")
+	local.notReady = false
+	local.directProcess = proc // EnsureDirect returns this (a started process)
+	schedulerReached := false
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) {
+		schedulerReached = true
+	}
+
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/comfyui/history", nil))
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", w.Code)
+	}
+	if schedulerReached {
+		t.Errorf("a direct request reached the scheduler; it must never swap")
+	}
+	if proc.serveCalls.Load() != 1 {
+		t.Errorf("serveCalls = %d, want 1", proc.serveCalls.Load())
 	}
 }

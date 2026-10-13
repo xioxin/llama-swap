@@ -36,38 +36,17 @@ func isComfyPromptSubmit(r *http.Request) bool {
 	return r.Method == http.MethodPost && strings.TrimSuffix(r.URL.Path, "/") == comfyPromptPath
 }
 
-// isComfyPassthrough reports whether a ComfyUI request is a read-only query or
-// a control call that must stay responsive even while a swap is in flight, and
-// therefore bypasses the scheduler queue. Workflow submits (POST /prompt) are
-// the only ComfyUI requests that queue.
+// isComfyDirect reports whether a ComfyUI request must be served straight to a
+// ready ComfyUI process and must NEVER enter the model scheduler — i.e. it can
+// neither queue for the GPU nor trigger a swap. Only a workflow submit
+// (POST /prompt) is allowed to swap; every other request (reads, settings
+// writes, uploads, interrupt, free, job cancel, static assets) is direct.
 //
-// Reads (GET): queue/history/job/status/view/assets — polled by the open UI.
-// Controls (POST): interrupt, free, job cancel — must be able to break in or
-// clean up without waiting behind the very swap they influence.
-func isComfyPassthrough(r *http.Request) bool {
-	path := strings.TrimSuffix(r.URL.Path, "/")
-	if path == "" {
-		path = "/"
-	}
-	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		// Every GET is a read: static assets, /ws, /queue, /history, /api/jobs,
-		// /system_stats, /view, /object_info, etc.
-		return true
-	case http.MethodPost:
-		switch path {
-		case "/interrupt", "/free", "/history", "/queue",
-			"/api/jobs/cancel":
-			return true
-		}
-		// /api/jobs/{id}/cancel and similar per-job control paths.
-		if strings.HasPrefix(path, "/api/jobs/") && strings.HasSuffix(path, "/cancel") {
-			return true
-		}
-		return false
-	default:
-		return false
-	}
+// This is what keeps the open ComfyUI UI from unloading a running LLM: a
+// history panel poll or a settings POST is not a reason to give ComfyUI the
+// GPU, so it must not reach EvictionFor.
+func isComfyDirect(r *http.Request) bool {
+	return !isComfyPromptSubmit(r)
 }
 
 // extractComfyPromptID pulls the prompt id from a ComfyUI POST /prompt response

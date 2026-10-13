@@ -11,6 +11,7 @@
   } from "../lib/activityFilters";
   import ActivityStats from "../components/ActivityStats.svelte";
   import ComfyJobsPanel from "../components/ComfyJobsPanel.svelte";
+  import QueuePanel from "../components/QueuePanel.svelte";
   import ActivityTable from "../components/ActivityTable.svelte";
 
   const storedPageSize = persistentStore<number>("activity-page-size", 25);
@@ -129,7 +130,8 @@
     <ActivityStats {stats} />
   </div>
 
-  <div class="mb-4">
+  <div class="mb-4 grid gap-4 lg:grid-cols-2">
+    <QueuePanel />
     <ComfyJobsPanel />
   </div>
 

@@ -251,6 +251,57 @@ func (c *Client) wait(ctx context.Context, poll time.Duration, done func(IdleSta
 	}
 }
 
+// comfyQueue is the raw /queue response. queue_running and queue_pending are
+// lists of queue-item tuples (number, prompt_id, prompt, extra_data, outputs),
+// so each element is decoded generically and the prompt id is pulled out.
+type comfyQueue struct {
+	QueueRunning []json.RawMessage `json:"queue_running"`
+	QueuePending []json.RawMessage `json:"queue_pending"`
+}
+
+// promptIDFromQueueItem extracts a prompt id from one /queue element. ComfyUI
+// sends queue items as tuples where the id is at index 1; a mapping with a
+// "prompt_id" field is also accepted for forward compatibility. It returns ""
+// when no id can be found.
+func promptIDFromQueueItem(raw json.RawMessage) string {
+	// Tuple form: [number, prompt_id, prompt, extra_data, outputs].
+	var tuple []json.RawMessage
+	if err := json.Unmarshal(raw, &tuple); err == nil && len(tuple) >= 2 {
+		var id string
+		if err := json.Unmarshal(tuple[1], &id); err == nil {
+			return id
+		}
+	}
+	// Object form: {"prompt_id": "..."}.
+	var obj struct {
+		PromptID string `json:"prompt_id"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return obj.PromptID
+	}
+	return ""
+}
+
+// queuedPromptIDs returns the prompt ids in ComfyUI's running and pending
+// queues, in that order.
+func (c *Client) queuedPromptIDs(ctx context.Context) (running, pending []string, err error) {
+	var q comfyQueue
+	if err := c.getJSON(ctx, "/queue", &q); err != nil {
+		return nil, nil, err
+	}
+	for _, item := range q.QueueRunning {
+		if id := promptIDFromQueueItem(item); id != "" {
+			running = append(running, id)
+		}
+	}
+	for _, item := range q.QueuePending {
+		if id := promptIDFromQueueItem(item); id != "" {
+			pending = append(pending, id)
+		}
+	}
+	return running, pending, nil
+}
+
 // JobState reports the current state of a prompt by id. It first checks the
 // running/pending queue and then history. A prompt in neither place is
 // StatusUnknown. Terminal history states map to completed/failed/cancelled.
@@ -260,22 +311,14 @@ func (c *Client) JobState(ctx context.Context, promptID string) (JobStatus, erro
 	}
 
 	// Still queued or executing?
-	var q struct {
-		QueueRunning []struct {
-			PromptID string `json:"prompt_id"`
-		} `json:"queue_running"`
-		QueuePending []struct {
-			PromptID string `json:"prompt_id"`
-		} `json:"queue_pending"`
-	}
-	if err := c.getJSON(ctx, "/queue", &q); err == nil {
-		for _, item := range q.QueueRunning {
-			if item.PromptID == promptID {
+	if running, pending, err := c.queuedPromptIDs(ctx); err == nil {
+		for _, id := range running {
+			if id == promptID {
 				return StatusRunning, nil
 			}
 		}
-		for _, item := range q.QueuePending {
-			if item.PromptID == promptID {
+		for _, id := range pending {
+			if id == promptID {
 				return StatusQueued, nil
 			}
 		}
@@ -309,27 +352,16 @@ type Job struct {
 // Jobs lists the prompts ComfyUI currently has queued or running. It is the
 // live-work view used for task visibility; terminal prompts are not included.
 func (c *Client) Jobs(ctx context.Context) ([]Job, error) {
-	var q struct {
-		QueueRunning []struct {
-			PromptID string `json:"prompt_id"`
-		} `json:"queue_running"`
-		QueuePending []struct {
-			PromptID string `json:"prompt_id"`
-		} `json:"queue_pending"`
-	}
-	if err := c.getJSON(ctx, "/queue", &q); err != nil {
+	running, pending, err := c.queuedPromptIDs(ctx)
+	if err != nil {
 		return nil, err
 	}
-	jobs := make([]Job, 0, len(q.QueueRunning)+len(q.QueuePending))
-	for _, item := range q.QueueRunning {
-		if item.PromptID != "" {
-			jobs = append(jobs, Job{PromptID: item.PromptID, Status: StatusRunning})
-		}
+	jobs := make([]Job, 0, len(running)+len(pending))
+	for _, id := range running {
+		jobs = append(jobs, Job{PromptID: id, Status: StatusRunning})
 	}
-	for _, item := range q.QueuePending {
-		if item.PromptID != "" {
-			jobs = append(jobs, Job{PromptID: item.PromptID, Status: StatusQueued})
-		}
+	for _, id := range pending {
+		jobs = append(jobs, Job{PromptID: id, Status: StatusQueued})
 	}
 	return jobs, nil
 }

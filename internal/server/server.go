@@ -417,7 +417,9 @@ func (s *Server) routes() {
 		CreateRequestLogMiddleware(s.logs.HttpLogs),
 		CreateCORSMiddleware(s.cfg),
 		authMW,
-	).ThenFunc(s.serveComfyUI)
+	).ThenFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.serveComfyUI(w, r, true)
+	})
 
 	// API group (API-key protected) consumed by the UI.
 	mux.Handle("POST /api/models/unload", apiChain.ThenFunc(s.handleAPIUnloadAll))
@@ -430,6 +432,7 @@ func (s *Server) routes() {
 	mux.Handle("GET /api/metrics/activity", apiChain.ThenFunc(s.handleAPIActivity))
 	mux.Handle("GET /api/metrics/stats", apiChain.ThenFunc(s.handleAPIActivityStats))
 	mux.Handle("GET /api/comfy/jobs", apiChain.ThenFunc(s.handleAPIComfyJobs))
+	mux.Handle("GET /api/queue", apiChain.ThenFunc(s.handleAPIQueue))
 	mux.Handle("GET /api/performance", apiChain.ThenFunc(s.handleAPIPerformance))
 	mux.Handle("GET /api/version", apiChain.ThenFunc(s.handleAPIVersion))
 	mux.Handle("GET /api/hardware", apiChain.ThenFunc(s.handleAPIHardware))

@@ -14,6 +14,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/cache"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/hw"
+	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
@@ -715,5 +716,31 @@ func TestServer_APILogEvents_InvalidStream(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", target, w.Code)
 		}
+	}
+}
+
+// TestServer_APIQueue proves GET /api/queue returns the scheduler queue view.
+func TestServer_APIQueue(t *testing.T) {
+	local := newStubRouter([]string{"m1"}, "")
+	local.queuedSnapshot = &scheduler.QueueSnapshot{
+		NextModel: "m1",
+		Queued: []scheduler.QueuedRequest{
+			{Model: "m1", Path: "/v1/chat/completions", Position: 1, NextSwapFor: true},
+		},
+	}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	defer s.store.Close()
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/queue", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var snap scheduler.QueueSnapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if snap.NextModel != "m1" || len(snap.Queued) != 1 || snap.Queued[0].Path != "/v1/chat/completions" {
+		t.Errorf("snapshot = %+v, want one queued m1 /v1/chat/completions", snap)
 	}
 }

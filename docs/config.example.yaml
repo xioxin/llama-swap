@@ -304,6 +304,11 @@ comfyui:
   # queueTimeout: max seconds a workflow submit (POST /prompt) waits in the
   # queue before it is rejected with 503. 0 (default) waits indefinitely.
   queueTimeout: 0
+  # startEvicts: whether starting ComfyUI may evict other mutually exclusive
+  # models to make room. ComfyUI starts into free headroom by default (false)
+  # and never unloads a running model; set true only if a start must reclaim a
+  # sibling's GPU when headroom is insufficient.
+  startEvicts: false
 
 # profiles: named model ID replacements switched at runtime through the UI or API
 # - optional, default: empty dictionary

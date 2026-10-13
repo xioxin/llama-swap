@@ -198,6 +198,15 @@ func (s *Server) handleAPIActivity(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(page)
 }
 
+// handleAPIQueue serves the scheduler's request-queue snapshot: what is
+// waiting, in order, and which model the head would swap in next. It is a
+// read-only visibility view and never affects scheduling.
+func (s *Server) handleAPIQueue(w http.ResponseWriter, r *http.Request) {
+	snap := s.local.QueuedSnapshot()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(snap)
+}
+
 // handleAPIActivityStats serves aggregate activity statistics and histograms.
 func (s *Server) handleAPIActivityStats(w http.ResponseWriter, r *http.Request) {
 	stats, err := s.store.Activity().Stats(r.Context(), store.ActivityStatsQuery{

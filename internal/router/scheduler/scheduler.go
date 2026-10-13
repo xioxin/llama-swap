@@ -66,6 +66,27 @@ type Scheduler interface {
 	// swap waiters and queued requests). Process teardown is the baseRouter's
 	// responsibility.
 	OnShutdown(err error)
+	// QueuedSnapshot returns an ordered, read-only view of the requests waiting
+	// in the queue plus the model the head of the queue would swap in next. It
+	// must run on the router's run-loop goroutine like every other Scheduler
+	// method (the baseRouter forwards it there).
+	QueuedSnapshot() QueueSnapshot
+}
+
+// QueuedRequest is one waiting request in the queue snapshot.
+type QueuedRequest struct {
+	Model       string    `json:"model"`
+	Path        string    `json:"path"`
+	EnqueuedAt  time.Time `json:"enqueued_at"`
+	WaitingMs   int64     `json:"waiting_ms"`
+	Position    int       `json:"position"`      // 1-based
+	NextSwapFor bool      `json:"next_swap_for"` // true for the head request
+}
+
+// QueueSnapshot is a read-only view of the scheduler queue for visibility UIs.
+type QueueSnapshot struct {
+	Queued    []QueuedRequest `json:"queued"`
+	NextModel string          `json:"next_model"` // model the head would swap in, "" when idle
 }
 
 // Effects is implemented by the baseRouter. The scheduler calls back through it
@@ -110,7 +131,11 @@ func New(conf config.Config, name string, logger *logmon.Monitor, planner Swappe
 
 // HandlerReq is one in-flight ServeHTTP request waiting for a routing decision.
 type HandlerReq struct {
-	Model      string
+	Model string
+	// Path and EnqueuedAt are observability-only: they describe the request for
+	// queue-visibility snapshots and never affect scheduling.
+	Path       string
+	EnqueuedAt time.Time
 	Ctx        context.Context
 	Admit      chan error
 	Respond    chan HandlerResp

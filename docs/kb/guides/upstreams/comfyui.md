@@ -3,7 +3,7 @@ title: ComfyUI with the /comfyui endpoint
 summary: Name a model comfyui_auto and use /comfyui/ so ComfyUI's websocket does not block model swapping.
 category: guides
 tags: [comfyui, image, websocket, upstream, swapping, ttl, docker]
-config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, comfyui.queueTimeout, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
+config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, comfyui.queueTimeout, comfyui.startEvicts, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
 updated: 2026-10-12
 ---
 
@@ -103,29 +103,25 @@ as usual: the page itself, `/api/prompt`, and any path not in the list.
 Query parameters are not part of the match, so `?clientId=...` makes no
 difference. `/wsapi` and `/api/jobs/12` are different paths and are not ignored.
 
-## Task queueing and swapping
+## What swaps and what does not
 
-Submitting a workflow (`POST /prompt`) is a task: it goes through llama-swap's
-request queue, so if a mutually exclusive model (a member of the same `routing`
-group) holds the GPU, the submit waits for that model to swap out.
+**Only a workflow submit (`POST /prompt`) may swap another model out.** Every
+other ComfyUI request — reads, settings writes, uploads, `/interrupt`, `/free`,
+job cancels, static assets — is served straight to ComfyUI and **never** evicts
+a running LLM. So opening the history or asset panel cannot unload a model.
 
-**Every other ComfyUI path stays responsive during a swap.** Read-only queries
-(`GET /queue`, `/history`, `/api/jobs`, `/system_stats`, `/view`, `/object_info`)
-and control calls (`POST /interrupt`, `/free`, job cancel) are served straight to
-the running ComfyUI process — never queued. So the open ComfyUI UI keeps working
-while a model swap is in flight; only workflow submits wait.
+Those direct requests may still **start** ComfyUI if it is not running: they hold
+the request until ComfyUI is ready, then serve it. Starting ComfyUI needs only a
+small VRAM headroom (~500–700MiB), so by default it starts into free memory
+without evicting anything (`comfyui.startEvicts: false`). Set `startEvicts: true`
+only if a start should reclaim a sibling model's GPU when headroom is tight.
 
-`comfyui.queueTimeout` bounds how long a submit may wait in the queue before it
-is rejected with `503` (default `0` = wait forever). Set it so a client is not
-left hanging behind a stuck swap.
+- **`/comfyui/`** keeps its start-gating: a `GET` to an ignored path (static
+  assets, `/ws`, `/api/jobs`) cannot start a cold ComfyUI. Other requests start it.
+- **`comfyui.port`** (dedicated listener) cold-starts ComfyUI on **any** request.
 
-Set `comfyui.swapMode` to control what "swapping ComfyUI out" means when another
-model needs the GPU:
-
-| swapMode | swap-out behaviour |
-| --- | --- |
-| `unload` (default) | stop the ComfyUI process, like every other model |
-| `cleanup` | keep the process running and only free its GPU memory (`POST /free`), so the next swap-in is fast |
+`comfyui.queueTimeout` bounds how long a `POST /prompt` may wait in the queue
+before it is rejected with `503` (default `0` = wait forever).
 
 ```yaml
 comfyui:
@@ -133,13 +129,20 @@ comfyui:
   swapMode: cleanup
   vramFreeFraction: 0.02
   queueTimeout: 300
+  startEvicts: false
 ```
 
-In `cleanup` mode a swap-out waits for ComfyUI's **own running workflows to
-finish** (its prompt queue empty), then frees its memory and keeps the process
-warm. Swapping a model *in* over ComfyUI does the same: it waits for in-flight
-workflows to finish and frees memory before the other model starts. TTL expiry
-and an explicit unload (`/unload`) still stop the process even in `cleanup` mode.
+Set `comfyui.swapMode` to control what "swapping ComfyUI out" means when a
+`POST /prompt` (or another model) needs the GPU:
+
+| swapMode | swap-out behaviour |
+| --- | --- |
+| `unload` (default) | stop the ComfyUI process, like every other model |
+| `cleanup` | keep the process running and only free its GPU memory (`POST /free`), so the next swap-in is fast |
+
+In `cleanup` mode a swap-out waits for ComfyUI's own running workflows to finish,
+then frees its memory and keeps the process warm. TTL expiry and an explicit
+unload (`/unload`) still stop the process even in `cleanup` mode.
 
 The memory free is issued as soon as the workflow queue is empty — llama-swap
 does **not** wait for VRAM to drop first (a finished workflow keeps its memory
@@ -147,11 +150,9 @@ until the free). After the free it briefly confirms VRAM was released, then
 proceeds regardless. The free and all status probes go directly to ComfyUI's own
 port, so they are never blocked by the swap they are unblocking.
 
-ComfyUI keeps a small CUDA context resident even after freeing memory (tens to
-hundreds of MiB). `comfyui.vramFreeFraction` is the fraction of device VRAM that
-may still be in use and still count as memory-free; the default `0.02` tolerates
-that resident context. Raise it if the post-free confirmation warns that VRAM
-was not released.
+`comfyui.vramFreeFraction` is the fraction of device VRAM that may still be in
+use and still count as memory-free (ComfyUI keeps a small CUDA context resident
+even after freeing). The default `0.02` tolerates that resident context.
 
 **ComfyUI must listen on `127.0.0.1`** so every submit goes through llama-swap's
 queue. A client that reaches ComfyUI's own port directly bypasses the queue and
@@ -171,6 +172,14 @@ Each submitted workflow also appears as a row in the main Activity table (`model
 `comfyui_auto`, path `/prompt`); its Status column shows the workflow's terminal
 state and the row is updated in place when it finishes. A workflow not observed
 within the tracking window is marked `unknown`.
+
+## Request queue visibility
+
+The Activity panel also shows a **Request Queue** view: the requests waiting in
+llama-swap's FIFO scheduler, in order, each with its model, request path and
+wait time, and which model the head of the queue would swap in next. It answers
+"what is queued and what loads next". The same data is available as JSON at
+`GET /api/queue`. This is a read-only view — it never affects scheduling.
 
 ## What goes wrong
 
