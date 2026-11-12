@@ -4,6 +4,7 @@
   import * as Dialog from "$lib/components/ui/dialog/index.js";
   import { copyText } from "../lib/clipboard";
   import { formatDuration } from "../lib/format";
+  import { apiUrl } from "../lib/apiPath";
   import { models } from "../stores/api";
 
   interface Props {
@@ -15,6 +16,12 @@
   let { capture, open, onclose }: Props = $props();
 
   let contentEl = $state<HTMLElement | null>(null);
+
+  // The server stamps rooted /api/comfy/view URLs on each output. Re-attach a
+  // reverse proxy's path prefix when the UI is mounted under one.
+  function mediaUrl(u?: string): string | undefined {
+    return u ? apiUrl(u) : u;
+  }
   let copiedWorkflow = $state(false);
 
   type Tab = "outputs" | "workflow" | "details";
@@ -167,9 +174,9 @@
                         </Button>
                       </div>
                     {:else if isImage(o)}
-                      <img src={o.url} alt={o.filename} class="max-h-full w-full object-contain" loading="lazy" />
+                      <img src={mediaUrl(o.url)} alt={o.filename} class="max-h-full w-full object-contain" loading="lazy" />
                     {:else}
-                      <video src={o.url} controls class="max-h-full w-full">
+                      <video src={mediaUrl(o.url)} controls class="max-h-full w-full">
                         <track kind="captions" />
                       </video>
                     {/if}
@@ -181,7 +188,7 @@
                     {/if}
                     <div class="flex flex-wrap gap-1 pt-1">
                       {#if o.download_url}
-                        <a href={o.download_url} class="inline-flex items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted" download>
+                        <a href={mediaUrl(o.download_url)} class="inline-flex items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted" download>
                           Download
                         </a>
                       {/if}

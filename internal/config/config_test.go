@@ -114,6 +114,73 @@ store:
 	})
 }
 
+func TestConfig_StorePersistCaptures(t *testing.T) {
+	t.Run("captures file derived from store.path", func(t *testing.T) {
+		dir := t.TempDir()
+		storePath := filepath.Join(dir, "metrics.db")
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + storePath + `
+  persistCaptures: true
+`))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.Store)
+		assert.True(t, cfg.Store.PersistCaptures)
+		assert.Equal(t, filepath.Join(dir, "metrics_captures.db"), cfg.Store.CapturesPath())
+	})
+
+	t.Run("in memory when not set", func(t *testing.T) {
+		cfg, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + filepath.Join(t.TempDir(), "metrics.db") + `
+`))
+		require.NoError(t, err)
+		assert.Empty(t, cfg.Store.CapturesPath())
+	})
+
+	t.Run("requires store.path", func(t *testing.T) {
+		_, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  persistCaptures: true
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "store.path must not be empty")
+	})
+
+	t.Run("captures path must be a file", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(dir, "metrics_captures.db"), 0o755))
+		_, err := LoadConfigFromReader(strings.NewReader(`
+store:
+  path: ` + filepath.Join(dir, "metrics.db") + `
+  persistCaptures: true
+`))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "store.persistCaptures:")
+		assert.Contains(t, err.Error(), "is a directory")
+	})
+}
+
+func TestConfig_StoreCapturesPath(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want string
+	}{
+		{"/path/to/metrics.db", "/path/to/metrics_captures.db"},
+		{"/path/to/metrics", "/path/to/metrics_captures"},
+		{"/path/to/llama.swap.sqlite", "/path/to/llama.swap_captures.sqlite"},
+		{"/path.d/metrics", "/path.d/metrics_captures"},
+		{"metrics.db", "metrics_captures.db"},
+		{"  /path/to/metrics.db  ", "/path/to/metrics_captures.db"},
+	} {
+		st := &Store{Path: tc.path, PersistCaptures: true}
+		assert.Equal(t, tc.want, st.CapturesPath(), tc.path)
+	}
+
+	assert.Empty(t, (&Store{Path: "/path/to/metrics.db"}).CapturesPath(), "not persisted")
+	assert.Empty(t, (*Store)(nil).CapturesPath(), "no store section")
+}
+
 func TestConfig_FindConfig(t *testing.T) {
 
 	// TODO?
@@ -1012,6 +1079,51 @@ models:
 	})
 }
 
+func TestConfig_MaxRequestBodyMB(t *testing.T) {
+	t.Run("defaults to 250", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 250, config.MaxRequestBodyMB)
+		assert.Equal(t, int64(250<<20), config.MaxRequestBodyBytes())
+	})
+
+	t.Run("sets the configured value", func(t *testing.T) {
+		content := `
+maxRequestBodyMB: 1024
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, 1024, config.MaxRequestBodyMB)
+		assert.Equal(t, int64(1024<<20), config.MaxRequestBodyBytes())
+	})
+
+	for _, value := range []string{"0", "-1"} {
+		t.Run("rejects "+value, func(t *testing.T) {
+			content := `
+maxRequestBodyMB: ` + value + `
+models:
+  model1:
+    cmd: server --port ${PORT}
+`
+			_, err := LoadConfigFromReader(strings.NewReader(content))
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), "maxRequestBodyMB must be >= 1")
+		})
+	}
+
+	t.Run("zero-value Config uses the default", func(t *testing.T) {
+		assert.Equal(t, int64(250<<20), Config{}.MaxRequestBodyBytes())
+	})
+}
+
 func TestConfig_UnloadTimeout(t *testing.T) {
 	t.Run("defaults to 10 seconds", func(t *testing.T) {
 		content := `
@@ -1658,6 +1770,23 @@ models:
 	assert.Equal(t, 10, modelConfig.Timeouts.TLSHandshake)
 	assert.Equal(t, 1, modelConfig.Timeouts.ExpectContinue)
 	assert.Equal(t, 90, modelConfig.Timeouts.IdleConn)
+}
+
+func TestConfig_DisableKeepAlives(t *testing.T) {
+	configYaml := `
+models:
+  model1:
+    cmd: test-server --port ${PORT}
+  model2:
+    cmd: test-server --port ${PORT}
+    disableKeepAlives: true
+`
+
+	config, err := LoadConfigFromReader(strings.NewReader(configYaml))
+	require.NoError(t, err)
+
+	assert.False(t, config.Models["model1"].DisableKeepAlives, "keep-alives stay on by default")
+	assert.True(t, config.Models["model2"].DisableKeepAlives)
 }
 
 func TestConfig_TimeoutsZeroAllowed(t *testing.T) {

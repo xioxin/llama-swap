@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 	"github.com/mostlygeek/llama-swap/internal/tailcat"
@@ -26,6 +27,9 @@ type peerMember struct {
 	transport    *http.Transport
 	tailcat      *tailcat.Client
 	apiKey       string
+	// upstream is the provider behind the peer, guessed once from its proxy
+	// host. hint.Unknown when no detection rule matches.
+	upstream hint.Upstream
 }
 
 type peerRoute struct {
@@ -111,6 +115,9 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 			Rewrite: func(r *httputil.ProxyRequest) {
 				r.SetURL(peer.ProxyURL)
 				r.Out.Host = r.Out.URL.Host
+				// The peer is a server-to-server hop. Some APIs (Anthropic)
+				// reject requests carrying a browser Origin; see issue #1214.
+				swaputil.StripBrowserRequestHeaders(r.Out.Header)
 			},
 		}
 
@@ -155,6 +162,7 @@ func NewPeer(cfg config.Config, logger *logmon.Monitor) (*Peer, error) {
 			transport:    peerTransport,
 			tailcat:      tailcatClient,
 			apiKey:       peer.ApiKey,
+			upstream:     hint.ForURL(peer.ProxyURL),
 		}
 		members = append(members, pp)
 
@@ -301,6 +309,12 @@ func (r *Peer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	pp := route.member
 
 	r.logger.Debugf("peer: routing model %s to peer %s as %s", data.ModelID, pp.peerID, route.modelID)
+
+	if h := hint.From(req.Context()); h != nil {
+		h.Route = hint.RoutePeer
+		h.PeerID = pp.peerID
+		h.Upstream = pp.upstream
+	}
 
 	if data.Model != route.modelID {
 		req, err = swaputil.ReplaceRequestModel(req, data.Model, route.modelID)

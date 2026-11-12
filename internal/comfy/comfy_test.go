@@ -5,13 +5,19 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
 
 // fakeComfy is a programmable ComfyUI stub. Each endpoint's handler can be set
 // per test; unset endpoints return empty-but-valid JSON.
+//
+// mu guards the programmable fields because tests may swap a response while a
+// probe is in flight (e.g. WaitIdle_BecomesIdle), and httptest serves handlers
+// on their own goroutines.
 type fakeComfy struct {
+	mu         sync.Mutex
 	mux        *http.ServeMux
 	queueJSON  string
 	statsJSON  string
@@ -30,17 +36,20 @@ func newFakeComfy() *fakeComfy {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(f.queueJSON))
+		_, _ = w.Write([]byte(f.queue()))
 	})
 	mux.HandleFunc("/system_stats", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(f.statsJSON))
+		_, _ = w.Write([]byte(f.stats()))
 	})
 	mux.HandleFunc("/free", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
 		f.freeCalls++
-		w.WriteHeader(f.freeStatus)
+		status := f.freeStatus
+		f.mu.Unlock()
+		w.WriteHeader(status)
 	})
 	mux.HandleFunc("/history/", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(f.histJSON))
+		_, _ = w.Write([]byte(f.hist()))
 	})
 	f.mux = mux
 	f.srv = httptest.NewServer(mux)
@@ -48,6 +57,22 @@ func newFakeComfy() *fakeComfy {
 }
 
 func (f *fakeComfy) close() { f.srv.Close() }
+
+func (f *fakeComfy) queue() string { f.mu.Lock(); defer f.mu.Unlock(); return f.queueJSON }
+func (f *fakeComfy) stats() string { f.mu.Lock(); defer f.mu.Unlock(); return f.statsJSON }
+func (f *fakeComfy) hist() string  { f.mu.Lock(); defer f.mu.Unlock(); return f.histJSON }
+
+func (f *fakeComfy) setQueueJSON(s string) { f.mu.Lock(); f.queueJSON = s; f.mu.Unlock() }
+func (f *fakeComfy) setStatsJSON(s string) { f.mu.Lock(); f.statsJSON = s; f.mu.Unlock() }
+func (f *fakeComfy) setHistJSON(s string)  { f.mu.Lock(); f.histJSON = s; f.mu.Unlock() }
+
+func (f *fakeComfy) setFreeStatus(status int) { f.mu.Lock(); f.freeStatus = status; f.mu.Unlock() }
+
+func (f *fakeComfy) freeCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.freeCalls
+}
 
 func (f *fakeComfy) client() *Client { return New(f.srv.URL, 2*time.Second) }
 
@@ -73,10 +98,8 @@ func TestComfy_IdleState_Empty(t *testing.T) {
 func TestComfy_IdleState_RunningNotIdle(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`
-	// 40 of 100 in use -> busy.
-	f.statsJSON = `{"devices":[{"vram_total":100,"vram_free":60}]}`
-
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`) // 40 of 100 in use -> busy.
+	f.setStatsJSON(`{"devices":[{"vram_total":100,"vram_free":60}]}`)
 	st, err := f.client().IdleState(context.Background())
 	if err != nil {
 		t.Fatalf("IdleState: %v", err)
@@ -93,8 +116,7 @@ func TestComfy_IdleState_VramNotIdle(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
 	// Empty queue but VRAM still held -> not idle under a small threshold.
-	f.statsJSON = `{"devices":[{"vram_total":100,"vram_free":50}]}`
-
+	f.setStatsJSON(`{"devices":[{"vram_total":100,"vram_free":50}]}`)
 	st, err := f.client().IdleState(context.Background())
 	if err != nil {
 		t.Fatalf("IdleState: %v", err)
@@ -118,8 +140,7 @@ func TestComfy_IdleState_ResidualContextIsIdle(t *testing.T) {
 	defer f.close()
 	// 796MiB resident of 33670758400 total -> ~2.4%, but with a tolerant
 	// threshold (default 2% is strict); model the ~30MiB case (~0.09%).
-	f.statsJSON = `{"devices":[{"vram_total":33670758400,"vram_free":33639301222}]}`
-
+	f.setStatsJSON(`{"devices":[{"vram_total":33670758400,"vram_free":33639301222}]}`)
 	st, err := f.client().IdleState(context.Background())
 	if err != nil {
 		t.Fatalf("IdleState: %v", err)
@@ -132,10 +153,10 @@ func TestComfy_IdleState_ResidualContextIsIdle(t *testing.T) {
 func TestComfy_IdleState_AggregatesDevices(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.statsJSON = `{"devices":[
+	f.setStatsJSON(`{"devices":[
 		{"vram_total":100,"vram_free":100},
 		{"vram_total":100,"vram_free":100}
-	]}`
+	]}`)
 
 	st, err := f.client().IdleState(context.Background())
 	if err != nil {
@@ -176,16 +197,15 @@ func TestComfy_FreeMemory_SendsUnloadAndFree(t *testing.T) {
 	if err := f.client().FreeMemory(context.Background()); err != nil {
 		t.Fatalf("FreeMemory: %v", err)
 	}
-	if f.freeCalls != 1 {
-		t.Errorf("freeCalls = %d, want 1", f.freeCalls)
+	if f.freeCallCount() != 1 {
+		t.Errorf("freeCalls = %d, want 1", f.freeCallCount())
 	}
 }
 
 func TestComfy_FreeMemory_Error(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.freeStatus = 500
-
+	f.setFreeStatus(500)
 	if err := f.client().FreeMemory(context.Background()); err == nil {
 		t.Fatalf("FreeMemory error = nil, want error on 500")
 	}
@@ -205,8 +225,7 @@ func TestComfy_WaitIdle_ReturnsWhenIdle(t *testing.T) {
 func TestComfy_WaitIdle_TimesOutWhenBusy(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`
-
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if err := f.client().WaitIdle(ctx, 0.02, 5*time.Millisecond); err == nil {
@@ -218,10 +237,10 @@ func TestComfy_WaitIdle_BecomesIdle(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
 	// Busy first, then idle after the first probe. Swap the handlers once.
-	f.queueJSON = `{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`)
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		f.queueJSON = `{"queue_running":[],"queue_pending":[]}`
+		f.setQueueJSON(`{"queue_running":[],"queue_pending":[]}`)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -236,8 +255,7 @@ func TestComfy_WaitQueueEmpty_IgnoresVram(t *testing.T) {
 	defer f.close()
 	// Queue empty but VRAM still held: WaitQueueEmpty must return (VRAM is not
 	// its concern), unlike WaitIdle.
-	f.statsJSON = `{"devices":[{"vram_total":100,"vram_free":10}]}`
-
+	f.setStatsJSON(`{"devices":[{"vram_total":100,"vram_free":10}]}`)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := f.client().WaitQueueEmpty(ctx, 5*time.Millisecond); err != nil {
@@ -248,8 +266,7 @@ func TestComfy_WaitQueueEmpty_IgnoresVram(t *testing.T) {
 func TestComfy_WaitQueueEmpty_WaitsForWorkflow(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`
-
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"a"}],"queue_pending":[]}`)
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if err := f.client().WaitQueueEmpty(ctx, 5*time.Millisecond); err == nil {
@@ -261,8 +278,7 @@ func TestComfy_WaitVramReleased_ConfirmsFree(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
 	// VRAM still held -> not released; a short confirm times out.
-	f.statsJSON = `{"devices":[{"vram_total":100,"vram_free":10}]}`
-
+	f.setStatsJSON(`{"devices":[{"vram_total":100,"vram_free":10}]}`)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
 	if err := f.client().WaitVramReleased(ctx, 0.02, 5*time.Millisecond); err == nil {
@@ -273,8 +289,7 @@ func TestComfy_WaitVramReleased_ConfirmsFree(t *testing.T) {
 func TestComfy_JobState_Running(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[{"prompt_id":"abc"}],"queue_pending":[]}`
-
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"abc"}],"queue_pending":[]}`)
 	got, err := f.client().JobState(context.Background(), "abc")
 	if err != nil {
 		t.Fatalf("JobState: %v", err)
@@ -287,8 +302,7 @@ func TestComfy_JobState_Running(t *testing.T) {
 func TestComfy_JobState_Queued(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[],"queue_pending":[{"prompt_id":"abc"}]}`
-
+	f.setQueueJSON(`{"queue_running":[],"queue_pending":[{"prompt_id":"abc"}]}`)
 	got, err := f.client().JobState(context.Background(), "abc")
 	if err != nil {
 		t.Fatalf("JobState: %v", err)
@@ -301,8 +315,7 @@ func TestComfy_JobState_Queued(t *testing.T) {
 func TestComfy_Jobs_ListsLiveWork(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[{"prompt_id":"r1"}],"queue_pending":[{"prompt_id":"p1"},{"prompt_id":"p2"}]}`
-
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"r1"}],"queue_pending":[{"prompt_id":"p1"},{"prompt_id":"p2"}]}`)
 	jobs, err := f.client().Jobs(context.Background())
 	if err != nil {
 		t.Fatalf("Jobs: %v", err)
@@ -325,8 +338,7 @@ func TestComfy_Jobs_ListsLiveWork(t *testing.T) {
 func TestComfy_JobState_Completed(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.histJSON = `{"abc":{"status":{"completed":true,"status_str":"success","messages":[]}}}`
-
+	f.setHistJSON(`{"abc":{"status":{"completed":true,"status_str":"success","messages":[]}}}`)
 	got, err := f.client().JobState(context.Background(), "abc")
 	if err != nil {
 		t.Fatalf("JobState: %v", err)
@@ -339,8 +351,7 @@ func TestComfy_JobState_Completed(t *testing.T) {
 func TestComfy_JobState_Failed(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.histJSON = `{"abc":{"status":{"completed":true,"status_str":"success","messages":[["execution_error",{}]]}}}`
-
+	f.setHistJSON(`{"abc":{"status":{"completed":true,"status_str":"success","messages":[["execution_error",{}]]}}}`)
 	got, err := f.client().JobState(context.Background(), "abc")
 	if err != nil {
 		t.Fatalf("JobState: %v", err)
@@ -353,8 +364,7 @@ func TestComfy_JobState_Failed(t *testing.T) {
 func TestComfy_JobState_Cancelled(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.histJSON = `{"abc":{"status":{"completed":true,"status_str":"success","messages":[["execution_interrupted",{}]]}}}`
-
+	f.setHistJSON(`{"abc":{"status":{"completed":true,"status_str":"success","messages":[["execution_interrupted",{}]]}}}`)
 	got, err := f.client().JobState(context.Background(), "abc")
 	if err != nil {
 		t.Fatalf("JobState: %v", err)
@@ -398,8 +408,7 @@ func TestComfy_JobStatus_IsTerminal(t *testing.T) {
 func TestComfy_QueueTupleShape(t *testing.T) {
 	f := newFakeComfy()
 	defer f.close()
-	f.queueJSON = `{"queue_running":[[1,"run-1",{}, {}, []]],"queue_pending":[[2,"pend-1",{}, {}, []],[3,"pend-2",{}, {}, []]]}`
-
+	f.setQueueJSON(`{"queue_running":[[1,"run-1",{}, {}, []]],"queue_pending":[[2,"pend-1",{}, {}, []],[3,"pend-2",{}, {}, []]]}`)
 	jobs, err := f.client().Jobs(context.Background())
 	if err != nil {
 		t.Fatalf("Jobs: %v", err)

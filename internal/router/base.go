@@ -11,6 +11,7 @@ import (
 
 	"github.com/mostlygeek/llama-swap/internal/comfy"
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/process"
 	"github.com/mostlygeek/llama-swap/internal/router/scheduler"
@@ -69,6 +70,11 @@ type baseRouter struct {
 	snapCh      chan chan scheduler.QueueSnapshot
 
 	runDone chan struct{}
+
+	// startGate, when set, is called before every swap. A non-nil error
+	// refuses the swap: nothing is stopped or started and the swap's waiters
+	// get the error. See SetStartGate.
+	startGate atomic.Pointer[func() error]
 
 	// testProcessed, when non-nil, receives one event after each handlerReq
 	// or swapDone has been fully processed by run(). Tests use it to wait
@@ -202,9 +208,37 @@ func (b *baseRouter) ModelState(modelID string) (process.ProcessState, bool) {
 	return p.State(), true
 }
 
+// SetStartGate installs a check that runs before every swap; a nil gate
+// removes it. Swaps are the only way the router starts a process, so a gate
+// that returns an error keeps every model stopped. A swap whose gate check
+// passed before the gate started refusing is cancelled by the next Unload,
+// which joins active swaps before stopping processes.
+func (b *baseRouter) SetStartGate(gate func() error) {
+	if gate == nil {
+		b.startGate.Store(nil)
+		return
+	}
+	b.startGate.Store(&gate)
+}
+
 // StartSwap implements scheduler.Effects, launching the swap goroutine.
-func (b *baseRouter) StartSwap(modelID string, evict []string) {
-	go b.doSwap(modelID, evict)
+func (b *baseRouter) StartSwap(modelID string, generation uint64, evict []string) func() {
+	ctx, cancel := context.WithCancel(b.shutdownCtx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if gate := b.startGate.Load(); gate != nil {
+			if err := (*gate)(); err != nil {
+				b.reportSwapDone(ctx, modelID, generation, err)
+				return
+			}
+		}
+		b.doSwap(ctx, modelID, generation, evict)
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 // GrantError implements scheduler.Effects.
@@ -256,6 +290,7 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 // notification rather than blocking the HTTP goroutine forever.
 func (b *baseRouter) trackedServe(modelID string, p process.Process) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		setLocalHint(r, p)
 		defer func() {
 			select {
 			case b.serveDoneCh <- scheduler.ServeDoneEvent{ModelID: modelID}:
@@ -266,7 +301,17 @@ func (b *baseRouter) trackedServe(modelID string, p process.Process) http.Handle
 	}
 }
 
-func (b *baseRouter) doSwap(modelID string, toStop []string) {
+// setLocalHint tells the metrics middleware, through the request's hint,
+// that a local process serves r and which upstream it detected.
+func setLocalHint(r *http.Request, p process.Process) {
+	if h := hint.From(r.Context()); h != nil {
+		h.Route = hint.RouteLocal
+		h.PeerID = ""
+		h.Upstream = p.Status().Upstream
+	}
+}
+
+func (b *baseRouter) doSwap(ctx context.Context, modelID string, generation uint64, toStop []string) {
 	timeout := b.healthCheckTimeout()
 
 	var wg sync.WaitGroup
@@ -283,6 +328,9 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 		}(b.processes[mID], mID)
 	}
 	wg.Wait()
+	if ctx.Err() != nil {
+		return
+	}
 
 	// EnsureReady rather than a State() check followed by Run: the router must
 	// not assume anything about the process. Deciding out here means acting on
@@ -291,16 +339,21 @@ func (b *baseRouter) doSwap(modelID string, toStop []string) {
 	// process nobody was ever going to start (issue #946). EnsureReady makes
 	// the same decision inside the process, where the state is owned.
 	target := b.processes[modelID]
-	err := target.EnsureReady(b.shutdownCtx, timeout)
-	if err != nil && b.shutdownCtx.Err() == nil {
-		// Quiet during shutdown: every in-flight swap fails at once there, and
-		// that is expected rather than worth a warning per model.
+	err := target.EnsureReady(ctx, timeout)
+	if err != nil && ctx.Err() == nil {
+		// Cancellation during unload or shutdown is expected.
 		b.logger.Warnf("%s: starting %s failed: %v", b.name, modelID, err)
 	}
 
+	b.reportSwapDone(ctx, modelID, generation, err)
+}
+
+// reportSwapDone tells the run loop a swap finished, unless the swap was
+// cancelled first.
+func (b *baseRouter) reportSwapDone(ctx context.Context, modelID string, generation uint64, err error) {
 	select {
-	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Err: err}:
-	case <-b.shutdownCtx.Done():
+	case b.swapDoneCh <- scheduler.SwapDone{ModelID: modelID, Generation: generation, Err: err}:
+	case <-ctx.Done():
 	}
 }
 
@@ -477,6 +530,14 @@ func (b *baseRouter) EnsureDirect(modelID string, ctx context.Context) (process.
 	if p.State() == process.StateReady {
 		return p, true
 	}
+	// Honor the pause/start gate. Direct starts bypass the scheduler's swap
+	// path, so without this check a paused server could still cold-start a
+	// model through a ComfyUI direct read.
+	if gate := b.startGate.Load(); gate != nil {
+		if err := (*gate)(); err != nil {
+			return nil, false
+		}
+	}
 	if err := p.EnsureReady(ctx, b.healthCheckTimeout()); err != nil {
 		return nil, false
 	}
@@ -631,6 +692,7 @@ func (b *baseRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				fmt.Sprintf("model %s is not loaded; ignored websocket requests cannot start it", data.ModelID))
 			return
 		}
+		setLocalHint(req, p)
 		p.ServeHTTP(w, req)
 		return
 	}

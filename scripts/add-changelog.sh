@@ -6,10 +6,17 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/add-changelog.sh <version> [codex|claude|opencode]
+Usage: scripts/add-changelog.sh [harness] [version]
+       scripts/add-changelog.sh [version]
 
-Adds the supplied release version to CHANGELOG.md. The default harness is
-claude.
+Creates changelog/v<version>.md with the release entry. The harness is
+codex, claude, opencode or pi and defaults to pi. When version is
+omitted it is the highest v<number> tag plus one.
+
+Environment:
+  CHANGELOG_MODEL  Model passed to the harness. Defaults to the harness
+         specific model (gpt-6-sol for codex, claude-opus-5-5 for claude,
+         qwen-3.8-next for pi). Ignored by opencode.
 EOF
 }
 
@@ -22,10 +29,33 @@ validate_version() {
   fi
 }
 
+next_version() {
+  local highest
+
+  highest="$(git tag --sort=-v:refname | grep -E '^v[0-9]+$' | head -n 1 || true)"
+  printf 'v%d\n' "$(( ${highest#v} + 1 ))"
+}
+
+check_changelog() {
+  local version="$1" file
+
+  file="changelog/${version}.md"
+
+  if ! git diff --quiet -- CHANGELOG.md changelog/; then
+    printf 'CHANGELOG.md or changelog/ has unstaged changes. Commit, stage or stash them first.\n' >&2
+    exit 1
+  fi
+
+  if [[ -e "$file" ]]; then
+    printf '%s already exists.\n' "$file" >&2
+    exit 1
+  fi
+}
+
 changelog_prompt() {
   local version="$1"
 
-  printf '%s\n' "Use docs/changelog-rules.md to add the ${version} release entry to CHANGELOG.md. The release changes are committed: inspect them with git log from the last release tag to HEAD (or main as the rules require). Read each commit's full message and use gh pr view to read each pull request's description and author. Do not use Git reflogs or .git/logs paths. Complete the edit before replying; do not only describe the planned work. Make only the required changelog update."
+  printf '%s\n' "Use docs/changelog-rules.md to create the file changelog/${version}.md containing the ${version} release entry. The release changes are committed: inspect them with git log from the last release tag to HEAD (or main as the rules require). Read each commit's full message and use gh pr view to read each pull request's description and author. Do not use Git reflogs or .git/logs paths. Complete the edit before replying; do not only describe the planned work. Make only the required changelog update."
 }
 
 run_codex() {
@@ -33,7 +63,7 @@ run_codex() {
 
   codex exec \
     --approve-for-me \
-    --model gpt-6-sol \
+    --model "${CHANGELOG_MODEL:-gpt-6-sol}" \
     -c 'model_reasoning_effort="medium"' \
     "$prompt"
 }
@@ -42,7 +72,7 @@ run_claude() {
   local prompt="$1"
 
   claude --print \
-    --model claude-opus-5-5 \
+    --model "${CHANGELOG_MODEL:-claude-opus-5-5}" \
     --permission-mode acceptEdits \
     --allowedTools 'Read' 'Edit' 'Bash(git log:*)' 'Bash(git tag:*)' \
       'Bash(git show:*)' 'Bash(gh pr view:*)' \
@@ -55,20 +85,41 @@ run_opencode() {
   opencode run "$prompt"
 }
 
+run_pi() {
+  local prompt="$1"
+
+  pi --print \
+    --model "${CHANGELOG_MODEL:-qwen-3.8-next}" \
+    -- "$prompt" </dev/null
+}
+
 main() {
-  if [[ $# -lt 1 || $# -gt 2 ]]; then
+  if [[ $# -gt 2 ]]; then
     usage >&2
     exit 1
   fi
 
-  local version="$1"
-  local harness="${2:-claude}"
+  local harness="pi"
+  local version=""
+
+  # The harness is optional: a leading v<number> is taken as the version.
+  if [[ $# -gt 0 && "$1" =~ ^v[0-9]+$ ]]; then
+    version="$1"
+  else
+    harness="${1:-pi}"
+    version="${2:-}"
+  fi
   local repo_root
   local prompt
 
-  validate_version "$version"
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   cd "$repo_root"
+  if [[ -z "$version" ]]; then
+    version="$(next_version)"
+  fi
+  validate_version "$version"
+  check_changelog "$version"
+  printf 'Adding changelog entry for %s using %s\n' "$version" "$harness"
   prompt="$(changelog_prompt "$version")"
 
   case "$harness" in
@@ -80,6 +131,9 @@ main() {
       ;;
     opencode)
       run_opencode "$prompt"
+      ;;
+    pi)
+      run_pi "$prompt"
       ;;
     *)
       printf 'Unknown harness: %s\n' "$harness" >&2

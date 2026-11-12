@@ -18,7 +18,9 @@ import (
 // config.
 
 func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
-	location := "/comfyui/"
+	// Relative Location so the redirect keeps a reverse proxy's path prefix
+	// (see redirectRelative).
+	location := "comfyui/"
 	if r.URL.RawQuery != "" {
 		location += "?" + r.URL.RawQuery
 	}
@@ -26,7 +28,7 @@ func handleComfyUIRedirect(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead {
 		status = http.StatusMovedPermanently
 	}
-	http.Redirect(w, r, location, status)
+	redirectRelative(w, location, status)
 }
 
 // comfyUIIgnorePaths are the paths under /comfyui/ that may not start an
@@ -77,6 +79,13 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 // Both surfaces share the same start gating: while the model is not loaded, a
 // GET to an ignored path cannot start it (see comfyUIIgnoresPath).
 func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request, dedicated bool) {
+	// Inference pause stops every local model, ComfyUI included. This gate is
+	// what keeps a direct (non-submit) request from cold-starting the process
+	// while the rest of the server is paused.
+	if s.pause.Paused() {
+		swaputil.SendError(w, r, swaputil.ErrInferencePaused)
+		return
+	}
 	if _, ok := s.cfg.Models[config.ComfyUIModelID]; !ok || !s.local.Handles(config.ComfyUIModelID) {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "local model "+config.ComfyUIModelID+" not found")
 		return
@@ -116,7 +125,7 @@ func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request, dedicated 
 			return
 		}
 		if s.cfg.ComfyUI != nil && s.cfg.ComfyUI.StartEvicts {
-			s.local.ServeHTTP(w, r) // scheduler may swap to make room
+			s.serveLocal(w, r) // scheduler may swap to make room
 			return
 		}
 		if p, ok := s.local.EnsureDirect(config.ComfyUIModelID, r.Context()); ok {
@@ -148,7 +157,7 @@ func (s *Server) serveComfyUI(w http.ResponseWriter, r *http.Request, dedicated 
 		r = r.WithContext(ctx)
 	}
 	recorder := wrapComfySubmit(w)
-	s.local.ServeHTTP(recorder, r)
+	s.serveLocal(recorder, r)
 	if !recorder.WroteHeader() {
 		// The queue wait timed out (or the client left) before the request
 		// reached ComfyUI: report 503 so the submit is visibly rejected rather

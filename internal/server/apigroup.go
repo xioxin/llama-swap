@@ -37,6 +37,22 @@ type apiModel struct {
 	// UI counts from it rather than from ReadySince, so a browser clock that
 	// differs from the server's doesn't skew the uptime.
 	UptimeMs int64 `json:"uptimeMs,omitempty"`
+	// LoadingProgress is the fraction loaded (0 to 1) the upstream last
+	// reported through its health check. Only set while the model is starting
+	// and its upstream reports progress.
+	LoadingProgress *float64 `json:"loadingProgress,omitempty"`
+	// LoadingMessage is the loading step the upstream last reported. Only set
+	// while the model is starting.
+	LoadingMessage string `json:"loadingMessage,omitempty"`
+	// Modalities mirrors the architecture block /v1/models reports, shaped to
+	// the UI's Model.modalities so the SSE feed and the OpenAI listing agree.
+	// Nil for peers and models without declared or discovered modalities.
+	Modalities *apiModalities `json:"modalities,omitempty"`
+}
+
+type apiModalities struct {
+	In  []string `json:"in,omitempty"`
+	Out []string `json:"out,omitempty"`
 }
 
 type apiProfile struct {
@@ -120,6 +136,7 @@ func (s *Server) modelStatus() []apiModel {
 		state := "stopped"
 		var readySince string
 		var uptimeMs int64
+		var loading process.LoadingProgress
 		if st, ok := running[id]; ok {
 			state = string(st.State)
 			if st.State == process.StateReady && !st.ReadySince.IsZero() {
@@ -127,24 +144,40 @@ func (s *Server) modelStatus() []apiModel {
 				// At least 1 so omitempty keeps it for a model that just became ready.
 				uptimeMs = max(1, time.Since(st.ReadySince).Milliseconds())
 			}
+			if st.State == process.StateStarting && st.Loading != nil {
+				loading = *st.Loading
+			}
 		}
 		// Same resolution /v1/models uses, so the dashboard and the OpenAI
 		// listing never disagree about what a model can do. Bound by
 		// shutdownCtx rather than a request: modelStatus is also called from
 		// event callbacks that have no request of their own.
 		caps := s.resolveCapabilities(s.shutdownCtx, id, mc)
-		_, capsMap, _, ctxLen := renderCapabilities(caps)
+		arch, capsMap, _, ctxLen := renderCapabilities(caps)
+		var modalities *apiModalities
+		if in, ok := arch["input_modalities"].([]string); ok {
+			modalities = &apiModalities{In: in}
+		}
+		if out, ok := arch["output_modalities"].([]string); ok {
+			if modalities == nil {
+				modalities = &apiModalities{}
+			}
+			modalities.Out = out
+		}
 		models = append(models, apiModel{
-			Id:            id,
-			Name:          mc.Name,
-			Description:   mc.Description,
-			State:         state,
-			Unlisted:      mc.Unlisted,
-			Aliases:       mc.Aliases,
-			Capabilities:  capsMap,
-			ContextLength: ctxLen,
-			ReadySince:    readySince,
-			UptimeMs:      uptimeMs,
+			Id:              id,
+			Name:            mc.Name,
+			Description:     mc.Description,
+			State:           state,
+			Unlisted:        mc.Unlisted,
+			Aliases:         mc.Aliases,
+			Capabilities:    capsMap,
+			Modalities:      modalities,
+			ContextLength:   ctxLen,
+			ReadySince:      readySince,
+			UptimeMs:        uptimeMs,
+			LoadingProgress: loading.Progress,
+			LoadingMessage:  loading.Message,
 		})
 	}
 
@@ -488,6 +521,7 @@ const (
 	msgTypeInFlight    messageType = "inflight"
 	msgTypeUIConfig    messageType = "uiConfig"
 	msgTypeProfile     messageType = "profileChanged"
+	msgTypePause       messageType = "pauseChanged"
 )
 
 // sendDropReportInterval is how often an SSE handler reports messages that
@@ -579,8 +613,8 @@ func (s *Server) serveSSE(w http.ResponseWriter, r *http.Request, name string, s
 }
 
 // handleAPIEvents streams server events (model status, activity, in-flight
-// requests, UI config, profile changes) to the client as Server-Sent Events.
-// Log data has its own stream, handleAPILogEvents.
+// requests, UI config, profile and pause changes) to the client as Server-Sent
+// Events. Log data has its own stream, handleAPILogEvents.
 func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 	s.serveSSE(w, r, "handleAPIEvents", func(send func(messageEnvelope)) func() {
 		sendModels := func() {
@@ -602,7 +636,12 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		sendUIConfig := func() {
-			if j, err := json.Marshal(s.cfg.UI); err == nil {
+			// The UI hides its Help page when the help agent is disabled.
+			uiConfig := struct {
+				config.UIConfig
+				HelpAgent config.HelpAgentConfig `json:"helpagent"`
+			}{s.cfg.UI, s.cfg.HelpAgent}
+			if j, err := json.Marshal(uiConfig); err == nil {
 				send(messageEnvelope{Type: msgTypeUIConfig, Data: string(j)})
 			}
 		}
@@ -612,8 +651,15 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		sendPause := func() {
+			if j, err := json.Marshal(map[string]bool{"paused": s.pause.Paused()}); err == nil {
+				send(messageEnvelope{Type: msgTypePause, Data: string(j)})
+			}
+		}
+
 		unsubscribe := []context.CancelFunc{
 			event.On(func(e swaputil.ProcessStateChangeEvent) { sendModels() }),
+			event.On(func(e swaputil.ProcessLoadingEvent) { sendModels() }),
 			event.On(func(e swaputil.ModelCapabilitiesChangedEvent) { sendModels() }),
 			event.On(func(e swaputil.ConfigFileChangedEvent) { sendModels() }),
 			event.On(func(e swaputil.ProfileChangedEvent) {
@@ -622,12 +668,14 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 			}),
 			event.On(func(e ActivityLogEvent) { sendActivity(e.Metrics.ID) }),
 			event.On(func(e swaputil.InFlightRequestsEvent) { sendInFlight(e) }),
+			event.On(func(e swaputil.InferencePausedEvent) { sendPause() }),
 		}
 
 		// initial payload
 		sendModels()
 		sendUIConfig()
 		sendProfile()
+		sendPause()
 		sendInFlight(s.inflight.Current())
 
 		return func() { cancelAll(unsubscribe) }

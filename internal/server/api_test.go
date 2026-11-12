@@ -220,6 +220,17 @@ func TestServer_HandleUpstream(t *testing.T) {
 		if w.Code != http.StatusMovedPermanently {
 			t.Errorf("status = %d, want 301", w.Code)
 		}
+		if got := w.Header().Get("Location"); got != "./m1/" {
+			t.Errorf("Location = %q, want ./m1/", got)
+		}
+	})
+
+	t.Run("preserves query string", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/m1?token=abc", nil))
+		if got := w.Header().Get("Location"); got != "./m1/?token=abc" {
+			t.Errorf("Location = %q, want ./m1/?token=abc", got)
+		}
 	})
 
 	t.Run("unknown model 404", func(t *testing.T) {
@@ -229,6 +240,52 @@ func TestServer_HandleUpstream(t *testing.T) {
 			t.Errorf("status = %d, want 404", w.Code)
 		}
 	})
+}
+
+// TestServer_HandleUpstreamRedirect_TrailingSlash covers the bare-model
+// trailing-slash redirect for names whose echoed form would break the
+// relative Location: slash names (a bare "author/model/" resolves against
+// /upstream/author/, doubling the path) and colon aliases (a bare
+// "model1:high/" parses as a URL scheme, not a path).
+func TestServer_HandleUpstreamRedirect_TrailingSlash(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  author/model:
+    cmd: echo ${PORT}
+  model1:
+    cmd: echo ${PORT}
+    aliases: [model1:high]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newTestServerWithConfig(cfg, newStubRouter([]string{"author/model", "model1"}, "ok"), newStubRouter(nil, ""))
+
+	tests := []struct {
+		name   string
+		method string
+		target string
+		code   int
+		loc    string
+	}{
+		{"slash name two segments", http.MethodGet, "/upstream/author/model", http.StatusMovedPermanently, "./model/"},
+		{"slash name escaped segment", http.MethodGet, "/upstream/author%2Fmodel", http.StatusMovedPermanently, "./author%2Fmodel/"},
+		{"colon alias", http.MethodGet, "/upstream/model1:high", http.StatusMovedPermanently, "./model1:high/"},
+		{"colon alias non-GET", http.MethodPost, "/upstream/model1:high", http.StatusPermanentRedirect, "./model1:high/"},
+		{"colon alias with query", http.MethodGet, "/upstream/model1:high?prompt=hi", http.StatusMovedPermanently, "./model1:high/?prompt=hi"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, httptest.NewRequest(tt.method, tt.target, nil))
+			if w.Code != tt.code {
+				t.Errorf("status = %d, want %d", w.Code, tt.code)
+			}
+			if got := w.Header().Get("Location"); got != tt.loc {
+				t.Errorf("Location = %q, want %q", got, tt.loc)
+			}
+		})
+	}
 }
 func TestProxy_HandleUpstreamPreservesEscapedPath(t *testing.T) {
 	tests := []struct {
@@ -568,7 +625,7 @@ func TestServer_HandleMetrics_Unavailable(t *testing.T) {
 func TestServer_Redirects(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 
-	for path, want := range map[string]string{"/": "/ui", "/upstream": "/ui/models"} {
+	for path, want := range map[string]string{"/": "ui/", "/upstream": "ui/#/models"} {
 		w := httptest.NewRecorder()
 		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
 		if w.Code != http.StatusFound {
@@ -712,6 +769,18 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		}
 	})
 
+	t.Run("embeddings", func(t *testing.T) {
+		m := getModel(t, newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{Embeddings: true},
+		}))
+		if m.Capabilities == nil || m.Capabilities["embeddings"] != true {
+			t.Error("expected embeddings: true")
+		}
+		if m.Architecture != nil {
+			t.Error("should not have architecture")
+		}
+	})
+
 	t.Run("context", func(t *testing.T) {
 		m := getModel(t, newServer(config.ModelConfig{
 			Capabilities: config.ModelCapConfig{Context: 32768},
@@ -754,6 +823,33 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		}
 	})
 
+	t.Run("decisions", func(t *testing.T) {
+		m := getModel(t, newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{In: []string{"text"}, Out: []string{"decisions"}},
+		}))
+		if m.Capabilities == nil || m.Capabilities["decisions"] != true {
+			t.Error("expected decisions: true")
+		}
+	})
+
+	t.Run("vision_decisions", func(t *testing.T) {
+		m := getModel(t, newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{In: []string{"text", "image"}, Out: []string{"decisions"}},
+		}))
+		if m.Capabilities == nil || m.Capabilities["decisions"] != true || m.Capabilities["vision"] != true {
+			t.Errorf("expected decisions and vision, got %v", m.Capabilities)
+		}
+	})
+
+	t.Run("text_output_not_decisions", func(t *testing.T) {
+		m := getModel(t, newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{In: []string{"text"}, Out: []string{"text"}},
+		}))
+		if _, ok := m.Capabilities["decisions"]; ok {
+			t.Errorf("text model should not report decisions, got %v", m.Capabilities)
+		}
+	})
+
 	t.Run("empty_skip", func(t *testing.T) {
 		m := getModel(t, newServer(config.ModelConfig{}))
 		if m.Architecture != nil {
@@ -773,32 +869,39 @@ func TestServer_HandleListModels_Capabilities(t *testing.T) {
 		}
 	})
 
-	t.Run("metadata_precedence", func(t *testing.T) {
+	t.Run("metadata_passthrough_with_caps", func(t *testing.T) {
 		m := getModel(t, newServer(config.ModelConfig{
-			Capabilities: config.ModelCapConfig{In: []string{"text"}},
+			Capabilities: config.ModelCapConfig{In: []string{"text"}, Context: 4096},
 			Metadata: map[string]any{
-				"architecture":   "should-be-dropped",
-				"custom_field":   "should-remain",
-				"capabilities":   "also-dropped",
-				"context_window": "also-dropped",
-				"other_metadata": "also-remain",
+				"architecture":   "preserved",
+				"custom_field":   "preserved",
+				"capabilities":   "preserved",
+				"context_window": 8192,
 			},
 		}))
+		// generated top-level fields come from capabilities, not metadata
 		if m.Architecture == nil || m.Architecture["input_modalities"] == nil {
 			t.Fatal("architecture should be rendered, not from metadata")
+		}
+		if m.ContextWindow != 4096 {
+			t.Errorf("top-level context_window = %d, want 4096", m.ContextWindow)
 		}
 		if m.Meta == nil || m.Meta["llamaswap"] == nil {
 			t.Fatal("meta.llamaswap should exist")
 		}
+		// custom metadata is kept as configured under meta.llamaswap
 		meta := m.Meta["llamaswap"].(map[string]any)
-		if _, ok := meta["architecture"]; ok {
-			t.Error("architecture should be filtered from metadata")
+		if meta["architecture"] != "preserved" {
+			t.Errorf("architecture = %v, want preserved", meta["architecture"])
 		}
-		if _, ok := meta["custom_field"]; !ok {
-			t.Error("custom_field should remain in metadata")
+		if meta["capabilities"] != "preserved" {
+			t.Errorf("capabilities = %v, want preserved", meta["capabilities"])
 		}
-		if _, ok := meta["context_window"]; ok {
-			t.Error("context_window should be filtered from metadata when caps are set")
+		if meta["custom_field"] != "preserved" {
+			t.Errorf("custom_field = %v, want preserved", meta["custom_field"])
+		}
+		if meta["context_window"] != float64(8192) { // JSON numbers decode as float64
+			t.Errorf("context_window = %v, want 8192", meta["context_window"])
 		}
 	})
 
@@ -877,6 +980,46 @@ func TestServer_ModelStatus_Capabilities(t *testing.T) {
 		if m.ContextLength != 0 {
 			t.Errorf("expected no context_length, got %d", m.ContextLength)
 		}
+		if m.Modalities != nil {
+			t.Errorf("expected no modalities, got %v", m.Modalities)
+		}
+	})
+
+	// The Models list groups video models by output modality, which has no
+	// capability flag: this payload is its only source for modalities.
+	t.Run("carries output modalities for video models", func(t *testing.T) {
+		s := newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{Out: []string{"video"}},
+		})
+		m := s.modelStatus()[0]
+		if m.Modalities == nil {
+			t.Fatal("expected modalities, got none")
+		}
+		if len(m.Modalities.Out) != 1 || m.Modalities.Out[0] != "video" {
+			t.Errorf("modalities.out = %v, want [video]", m.Modalities.Out)
+		}
+		if m.Modalities.In != nil {
+			t.Errorf("modalities.in = %v, want none", m.Modalities.In)
+		}
+		if len(m.Capabilities) != 0 {
+			t.Errorf("expected no capability flags, got %v", m.Capabilities)
+		}
+	})
+
+	t.Run("carries input modalities for vision models", func(t *testing.T) {
+		s := newServer(config.ModelConfig{
+			Capabilities: config.ModelCapConfig{In: []string{"text", "image"}, Out: []string{"text"}},
+		})
+		m := s.modelStatus()[0]
+		if m.Modalities == nil {
+			t.Fatal("expected modalities, got none")
+		}
+		if len(m.Modalities.In) != 2 || m.Modalities.In[1] != "image" {
+			t.Errorf("modalities.in = %v, want [text image]", m.Modalities.In)
+		}
+		if len(m.Modalities.Out) != 1 || m.Modalities.Out[0] != "text" {
+			t.Errorf("modalities.out = %v, want [text]", m.Modalities.Out)
+		}
 	})
 }
 
@@ -914,6 +1057,34 @@ func TestServer_ModelStatus_ReadySince(t *testing.T) {
 	for id, w := range want {
 		if got[id] != w {
 			t.Errorf("%s readySince = %q, want %q", id, got[id], w)
+		}
+	}
+}
+
+func TestServer_ModelStatus_LoadingProgress(t *testing.T) {
+	progress := 0.4
+	lp := &process.LoadingProgress{Progress: &progress, Message: "loading tensors"}
+	local := newStubRouter(nil, "")
+	local.running = map[string]process.ProcessState{
+		"starting": process.StateStarting,
+		"ready":    process.StateReady,
+	}
+	// ready still has progress to check that only starting models report it.
+	local.loading = map[string]*process.LoadingProgress{"starting": lp, "ready": lp}
+	s := newTestServer(local, newStubRouter(nil, ""))
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{
+		"starting": {}, "ready": {}, "stopped": {},
+	}}
+
+	for _, m := range s.modelStatus() {
+		if m.Id == "starting" {
+			if m.LoadingProgress == nil || *m.LoadingProgress != progress || m.LoadingMessage != "loading tensors" {
+				t.Errorf("starting: progress = %v, message = %q, want %v and %q", m.LoadingProgress, m.LoadingMessage, progress, "loading tensors")
+			}
+			continue
+		}
+		if m.LoadingProgress != nil || m.LoadingMessage != "" {
+			t.Errorf("%s: progress = %v, message = %q, want neither", m.Id, m.LoadingProgress, m.LoadingMessage)
 		}
 	}
 }

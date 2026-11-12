@@ -16,6 +16,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/docagent"
 	"github.com/mostlygeek/llama-swap/internal/event"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/mcptools"
 	"github.com/mostlygeek/llama-swap/internal/process"
@@ -24,6 +25,7 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/store/sqlite"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
+	"github.com/stretchr/testify/assert"
 )
 
 // stubRouter is a minimal router.LocalRouter for Server dispatch tests.
@@ -34,9 +36,11 @@ type stubRouter struct {
 	shutdownCalls     atomic.Int32
 	running           map[string]process.ProcessState
 	readySince        map[string]time.Time
+	loading           map[string]*process.LoadingProgress
 	unloadCalls       atomic.Int32
 	unloadModels      []string
 	unloadTimeout     time.Duration
+	onUnload          func()
 	loggers           map[string]*logmon.Monitor
 	directProcess     process.Process
 	notReady          bool
@@ -68,7 +72,7 @@ func (s *stubRouter) RunningModels() map[string]process.ProcessState { return s.
 func (s *stubRouter) RunningStatus() map[string]process.Status {
 	out := make(map[string]process.Status, len(s.running))
 	for id, st := range s.running {
-		out[id] = process.Status{State: st, ReadySince: s.readySince[id]}
+		out[id] = process.Status{State: st, ReadySince: s.readySince[id], Loading: s.loading[id]}
 	}
 	return out
 }
@@ -76,7 +80,11 @@ func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
 	s.unloadCalls.Add(1)
 	s.unloadTimeout = timeout
 	s.unloadModels = append([]string(nil), models...)
+	if s.onUnload != nil {
+		s.onUnload()
+	}
 }
+func (s *stubRouter) SetStartGate(func() error) {}
 func (s *stubRouter) ProcessLogger(modelID string) (*logmon.Monitor, bool) {
 	if s.loggers != nil {
 		if lg, ok := s.loggers[modelID]; ok {
@@ -163,7 +171,7 @@ func newTestServerWithConfig(cfg config.Config, local router.LocalRouter, peer r
 	ctx, cancel := context.WithCancel(context.Background())
 	logs := logmon.NewGroup(io.Discard, true, true, true)
 	proxylog := logs.ProxyLogs
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	if err != nil {
 		panic(err)
 	}
@@ -178,6 +186,7 @@ func newTestServerWithConfig(cfg config.Config, local router.LocalRouter, peer r
 		peer:        peer,
 		shutdownCtx: ctx,
 		shutdownFn:  cancel,
+		pause:       NewPauseState(),
 	}
 	s.routes()
 	return s
@@ -207,7 +216,7 @@ var testClock = time.Date(2026, 3, 14, 15, 9, 26, 0, time.UTC)
 
 func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	t.Helper()
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	if err != nil {
 		t.Fatalf("sqlite.New: %v", err)
 	}
@@ -216,7 +225,11 @@ func newTestMetricsMonitor(t *testing.T, logger *logmon.Monitor, maxMetrics int,
 			t.Errorf("store.Close: %v", err)
 		}
 	})
-	return newMetricsMonitor(logger, maxMetrics, captureBufferMB, st)
+	mm := newMetricsMonitor(logger, maxMetrics, captureBufferMB, st)
+	// Cleanups run last-in first-out, so the pruner stops before the store
+	// closes.
+	t.Cleanup(func() { mm.Close() })
+	return mm
 }
 
 func metricsEntries(t *testing.T, mm *metricsMonitor) []ActivityLogEntry {
@@ -249,12 +262,12 @@ func TestServer_New_GroupConfig(t *testing.T) {
 	discard := logmon.NewGroup(io.Discard, true, true, true)
 	cfg := config.Config{HealthCheckTimeout: 15}
 	cfg.Routing.Router.Use = "group"
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	if err != nil {
 		t.Fatalf("sqlite.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil)
+	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New (group): %v", err)
 	}
@@ -279,12 +292,12 @@ func TestServer_New_MatrixConfig(t *testing.T) {
 	cfg.Routing.Router.Settings.Matrix = &config.MatrixConfig{
 		Sets: config.OrderedSets{{Name: "single", DSL: "model"}},
 	}
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	if err != nil {
 		t.Fatalf("sqlite.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil)
+	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New (matrix): %v", err)
 	}
@@ -567,12 +580,12 @@ func TestServer_New_OnStartupProfile(t *testing.T) {
 		"coding": {Pins: map[string]string{"llm-code": "model"}},
 	}
 	cfg.Hooks.OnStartup.Profile = "coding"
-	st, err := sqlite.New("")
+	st, err := sqlite.New("", "")
 	if err != nil {
 		t.Fatalf("sqlite.New: %v", err)
 	}
 	defer st.Close()
-	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil)
+	s, err := New(cfg, discard, nil, st, BuildInfo{}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New (startup profile): %v", err)
 	}
@@ -638,5 +651,78 @@ func TestServer_LogStream_UnknownID_Returns400(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status=%d want 400", w.Code)
+	}
+}
+
+func TestProxy_ConfiguredVoicesOverrideUpstream(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{
+		"tts":      {Capabilities: config.ModelCapConfig{Voices: []string{"voicea", "voiceb", "voicec"}}},
+		"tts-none": {},
+	}}
+	local := newStubRouter([]string{"tts", "tts-none"}, "upstream")
+	s := newTestServerWithConfig(cfg, local, newStubRouter(nil, ""))
+
+	t.Run("configured voices are returned", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/audio/voices?model=tts", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", w.Code)
+		}
+		if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Content-Type = %q", ct)
+		}
+		var got struct {
+			Voices []string `json:"voices"`
+			Model  string   `json:"model"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(got.Voices, ",") != "voicea,voiceb,voicec" || got.Model != "tts" {
+			t.Errorf("unexpected body: %s", w.Body.String())
+		}
+	})
+
+	t.Run("model without voices goes to upstream", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/audio/voices?model=tts-none", nil))
+
+		if w.Body.String() != "upstream" {
+			t.Errorf("body = %q, want upstream", w.Body.String())
+		}
+	})
+}
+
+func TestServer_MeteredTask(t *testing.T) {
+	tests := []struct {
+		path    string
+		want    hint.Task
+		metered bool
+	}{
+		{"/v1/chat/completions", hint.TaskChat, true},
+		{"/v1/completions", hint.TaskChat, true},
+		{"/v1/messages", hint.TaskChat, true},
+		{"/infill", hint.TaskChat, true},
+		{"/v/chat/completions", hint.TaskChat, true},
+		{"/v1/embeddings", hint.TaskEmbedding, true},
+		{"/v1/rerank", hint.TaskRerank, true},
+		{"/v1/messages/count_tokens", hint.TaskTokenCount, true},
+		{"/v1/images/generations", hint.TaskImageGeneration, true},
+		{"/sdapi/v1/img2img", hint.TaskImageEdit, true},
+		{"/v1/audio/speech", hint.TaskSpeech, true},
+		{"/v1/audio/transcriptions", hint.TaskTranscription, true},
+		{"/v1/systemone", hint.TaskDecision, true},
+		{"/audioapi/v1/tasks/run", hint.TaskAudio, true},
+		{"/v1/realtime", hint.TaskRealtime, true},
+		// listing endpoints are not inference
+		{"/v1/audio/voices", "", false},
+		{"/v1/models", "", false},
+		{"/props", "", false},
+	}
+	for _, tt := range tests {
+		task, metered := meteredTask(tt.path)
+		assert.Equal(t, tt.metered, metered, "metered %s", tt.path)
+		assert.Equal(t, tt.want, task, "task %s", tt.path)
 	}
 }

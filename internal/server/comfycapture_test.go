@@ -7,10 +7,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/comfy"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
+	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
 func TestServer_ComfyCaptureStoreAndRetrieve(t *testing.T) {
@@ -22,15 +24,19 @@ func TestServer_ComfyCaptureStoreAndRetrieve(t *testing.T) {
 			{NodeID: "47", Filename: "a.png", Type: "output", Kind: "image", Width: 8, Height: 8},
 		},
 	}
-	if !mm.addComfyCapture(7, cap) {
+	id := store.NewCaptureID(time.Now())
+	if !mm.addComfyCapture(id, cap) {
 		t.Fatal("addComfyCapture returned false")
 	}
-	got := mm.getComfyCaptureByID(7)
-	if got == nil || got.PromptID != "wf-1" || len(got.Outputs) != 1 || got.Outputs[0].Filename != "a.png" {
-		t.Fatalf("getComfyCaptureByID = %+v", got)
+	kind, got, reqResp, found := mm.readCapture(id)
+	if !found || kind != CaptureKindComfy || reqResp != nil {
+		t.Fatalf("readCapture = kind %q found %v reqResp %v, want comfy", kind, found, reqResp)
 	}
-	if mm.getComfyCaptureByID(999) != nil {
-		t.Fatal("expected nil for unknown comfy capture")
+	if got == nil || got.PromptID != "wf-1" || len(got.Outputs) != 1 || got.Outputs[0].Filename != "a.png" {
+		t.Fatalf("readCapture = %+v", got)
+	}
+	if _, _, _, found := mm.readCapture(store.NewCaptureID(time.Now())); found {
+		t.Fatal("expected not found for unknown comfy capture")
 	}
 }
 
@@ -44,15 +50,17 @@ func TestServer_APICapture_ComfyKind(t *testing.T) {
 	// metrics captures are disabled unless captureBufferMB>0; build a monitor
 	// with captures on and inject directly.
 	s.metrics = newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
-	s.metrics.addComfyCapture(11, &comfy.Capture{
+	comfyID := s.metrics.newCaptureID(time.Now())
+	reqRespID := s.metrics.newCaptureID(time.Now())
+	s.metrics.addComfyCapture(comfyID, &comfy.Capture{
 		PromptID: "wf-1",
 		Outputs:  []comfy.Output{{Filename: "a.png", Kind: "image", Type: "output"}},
 	})
-	s.metrics.addCapture(ReqRespCapture{ID: 12, ReqPath: "/v1/chat/completions"})
+	s.metrics.addCapture(reqRespID, ReqRespCapture{ID: 12, ReqPath: "/v1/chat/completions"})
 
 	// Comfy row.
 	w := httptest.NewRecorder()
-	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/11", nil))
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/"+comfyID, nil))
 	var env struct {
 		Kind    string          `json:"kind"`
 		Payload json.RawMessage `json:"payload"`
@@ -69,7 +77,7 @@ func TestServer_APICapture_ComfyKind(t *testing.T) {
 
 	// reqresp row.
 	w = httptest.NewRecorder()
-	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/12", nil))
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/captures/"+reqRespID, nil))
 	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

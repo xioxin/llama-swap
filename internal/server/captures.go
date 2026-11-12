@@ -1,18 +1,22 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/mostlygeek/llama-swap/internal/comfy"
+	"github.com/mostlygeek/llama-swap/internal/store"
 )
 
-// ReqRespCapture is a stored request/response pair for a single metered request.
+// ReqRespCapture is a stored request/response pair for a single metered
+// request. ID is the activity row's ID.
 type ReqRespCapture struct {
 	ID          int               `json:"id"`
 	ReqPath     string            `json:"req_path"`
@@ -128,9 +132,10 @@ func decompressCapture(data []byte) (*ReqRespCapture, error) {
 	return &capture, nil
 }
 
-// addCapture compresses and stores a capture in the cache. Returns true if the
-// capture was stored.
-func (mp *metricsMonitor) addCapture(capture ReqRespCapture) bool {
+// addCapture compresses a capture and stores it under captureID, then asks the
+// background pruner to delete the oldest captures if the total is now over
+// the capture size limit. Returns true if the capture was stored.
+func (mp *metricsMonitor) addCapture(captureID string, capture ReqRespCapture) bool {
 	if !mp.enableCaptures {
 		return false
 	}
@@ -141,29 +146,53 @@ func (mp *metricsMonitor) addCapture(capture ReqRespCapture) bool {
 		return false
 	}
 
-	if err := mp.captureCache.Add(capture.ID, compressed); err != nil {
-		mp.logger.Warnf("capture %d too large (%d bytes), skipping: %v", capture.ID, len(compressed), err)
+	// captureBuffer limits compressed bytes, the size actually stored.
+	if int64(len(compressed)) > mp.maxCaptureBytes {
+		mp.logger.Warnf("capture %s too large (%d bytes), skipping: exceeds captureBuffer of %d bytes", captureID, len(compressed), mp.maxCaptureBytes)
 		return false
 	}
 
+	// Like queueMetrics, this runs after the handler returned, so it does not
+	// use the request context.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	captures := mp.store.Captures()
+	if err := captures.Put(ctx, store.CaptureEntry{
+		ID:                captureID,
+		Data:              compressed,
+		UncompressedBytes: int64(uncompressedBytes),
+	}); err != nil {
+		mp.logger.Warnf("failed to store capture %s: %v", captureID, err)
+		return false
+	}
+	mp.requestCapturePrune()
+
 	compressionRatio := (1 - float64(len(compressed))/float64(uncompressedBytes)) * 100
-	mp.logger.Debugf("Capture %d compressed and saved: %d bytes -> %d bytes (%.1f%% compression)", capture.ID, uncompressedBytes, len(compressed), compressionRatio)
+	mp.logger.Debugf("Capture %s compressed and saved: %d bytes -> %d bytes (%.1f%% compression)", captureID, uncompressedBytes, len(compressed), compressionRatio)
 	return true
 }
 
-// getCaptureByID decompresses and unmarshals a capture by ID. Returns nil if
-// the capture is not found or decompression fails.
-func (mp *metricsMonitor) getCaptureByID(id int) *ReqRespCapture {
-	if mp.captureCache == nil {
+// getCaptureByID decompresses and unmarshals a capture by capture ID. Returns
+// nil if captures are disabled, the capture is not found, or decompression
+// fails.
+func (mp *metricsMonitor) getCaptureByID(id string) *ReqRespCapture {
+	if !mp.enableCaptures {
 		return nil
 	}
-	data, err := mp.captureCache.Get(id)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entry, found, err := mp.store.Captures().Get(ctx, id)
 	if err != nil {
+		mp.logger.Warnf("failed to read capture %s: %v", id, err)
 		return nil
 	}
-	capture, err := decompressCapture(data)
+	if !found {
+		return nil
+	}
+	capture, err := decompressCapture(entry.Data)
 	if err != nil {
-		mp.logger.Warnf("failed to decompress capture %d: %v", id, err)
+		mp.logger.Warnf("failed to decompress capture %s: %v", id, err)
 		return nil
 	}
 	return capture
@@ -206,58 +235,98 @@ const (
 	CaptureKindComfy   CaptureKind = "comfy"
 )
 
-// storedComfyCapture wraps a comfy.Capture for storage so the cache can hold
-// both capture shapes keyed by activity row ID.
+// captureTagComfy prefixes a compressed capture blob to mark it as a ComfyUI
+// snapshot. The tag sits in front of the CBOR document inside the zstd frame: a
+// CBOR map always starts with a 0xa* byte, so 0x01 is unambiguous.
+// Request/response captures keep the upstream format (untagged CBOR), so a
+// capture written by upstream code still decodes as a reqresp capture.
+const captureTagComfy byte = 0x01
+
+// storedComfyCapture is the CBOR payload of a ComfyUI capture snapshot.
 type storedComfyCapture struct {
-	ID      int            `json:"id"`
 	Capture *comfy.Capture `json:"capture"`
 }
 
-// addComfyCapture stores a ComfyUI capture snapshot under its activity row ID.
-// Only the small JSON/metadata snapshot is stored; output media stays on
-// ComfyUI and is proxied live. Returns true when stored.
-func (mp *metricsMonitor) addComfyCapture(id int, capture *comfy.Capture) bool {
-	if mp.captureCache == nil || capture == nil {
+// addComfyCapture stores a ComfyUI capture snapshot under captureID, the
+// capture ID recorded on its activity row. Only the small JSON/metadata
+// snapshot is stored; output media stays on ComfyUI and is proxied live.
+// Returns true when stored.
+func (mp *metricsMonitor) addComfyCapture(captureID string, capture *comfy.Capture) bool {
+	if !mp.enableCaptures || capture == nil {
 		return false
 	}
-	wrapped := storedComfyCapture{ID: id, Capture: capture}
-	compressed, uncompressed, err := compressComfyCapture(&wrapped)
+
+	cborBytes, err := cbor.Marshal(storedComfyCapture{Capture: capture})
 	if err != nil {
-		mp.logger.Warnf("failed to compress comfy capture %d: %v", id, err)
+		mp.logger.Warnf("failed to marshal comfy capture %s: %v", captureID, err)
 		return false
 	}
-	if err := mp.captureCache.Add(id, compressed); err != nil {
-		mp.logger.Warnf("comfy capture %d too large (%d bytes), skipping: %v", id, len(compressed), err)
+	// Tag inside the zstd frame so a comfy capture is distinguishable from an
+	// untagged reqresp capture without an extra store column.
+	tagged := make([]byte, 0, len(cborBytes)+1)
+	tagged = append(tagged, captureTagComfy)
+	tagged = append(tagged, cborBytes...)
+	compressed := zstdEnc.EncodeAll(tagged, nil)
+
+	// captureBuffer limits compressed bytes, the size actually stored.
+	if int64(len(compressed)) > mp.maxCaptureBytes {
+		mp.logger.Warnf("comfy capture %s too large (%d bytes), skipping: exceeds captureBuffer of %d bytes", captureID, len(compressed), mp.maxCaptureBytes)
 		return false
 	}
-	mp.logger.Debugf("Comfy capture %d saved: %d -> %d bytes", id, uncompressed, len(compressed))
+
+	// Like queueMetrics, this runs after the handler returned, so it does not
+	// use the request context.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := mp.store.Captures().Put(ctx, store.CaptureEntry{
+		ID:                captureID,
+		Data:              compressed,
+		UncompressedBytes: int64(len(tagged)),
+	}); err != nil {
+		mp.logger.Warnf("failed to store comfy capture %s: %v", captureID, err)
+		return false
+	}
+	mp.requestCapturePrune()
+
+	mp.logger.Debugf("Comfy capture %s saved: %d -> %d bytes", captureID, len(tagged), len(compressed))
 	return true
 }
 
-// getComfyCaptureByID returns a stored ComfyUI capture, or nil when absent.
-func (mp *metricsMonitor) getComfyCaptureByID(id int) *comfy.Capture {
-	if mp.captureCache == nil {
-		return nil
+// readCapture loads a stored capture of either shape. Exactly one of comfyCap
+// and reqResp is non-nil when found is true. It is the read side of
+// addComfyCapture and getCaptureByID's shared store.
+func (mp *metricsMonitor) readCapture(id string) (kind CaptureKind, comfyCap *comfy.Capture, reqResp *ReqRespCapture, found bool) {
+	if !mp.enableCaptures {
+		return "", nil, nil, false
 	}
-	data, err := mp.captureCache.Get(id)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	entry, ok, err := mp.store.Captures().Get(ctx, id)
 	if err != nil {
-		return nil
+		mp.logger.Warnf("failed to read capture %s: %v", id, err)
+		return "", nil, nil, false
 	}
-	raw, err := zstdDec.DecodeAll(data, nil)
+	if !ok {
+		return "", nil, nil, false
+	}
+	raw, err := zstdDec.DecodeAll(entry.Data, nil)
 	if err != nil {
-		return nil
+		mp.logger.Warnf("failed to decompress capture %s: %v", id, err)
+		return "", nil, nil, false
 	}
-	var wrapped storedComfyCapture
-	if err := cbor.Unmarshal(raw, &wrapped); err != nil {
-		return nil
+	if len(raw) > 0 && raw[0] == captureTagComfy {
+		var wrapped storedComfyCapture
+		if err := cbor.Unmarshal(raw[1:], &wrapped); err != nil || wrapped.Capture == nil {
+			mp.logger.Warnf("failed to unmarshal comfy capture %s: %v", id, err)
+			return "", nil, nil, false
+		}
+		return CaptureKindComfy, wrapped.Capture, nil, true
 	}
-	return wrapped.Capture
-}
-
-func compressComfyCapture(c *storedComfyCapture) ([]byte, int, error) {
-	cborBytes, err := cbor.Marshal(c)
-	if err != nil {
-		return nil, 0, fmt.Errorf("marshal comfy capture: %w", err)
+	var capture ReqRespCapture
+	if err := cbor.Unmarshal(raw, &capture); err != nil {
+		mp.logger.Warnf("failed to unmarshal capture %s: %v", id, err)
+		return "", nil, nil, false
 	}
-	return zstdEnc.EncodeAll(cborBytes, nil), len(cborBytes), nil
+	return CaptureKindReqResp, nil, &capture, true
 }

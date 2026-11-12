@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"github.com/mostlygeek/llama-swap/internal/hint"
 	"net/http"
 	"time"
 
@@ -21,12 +22,19 @@ const (
 )
 
 // Status is a snapshot of a process's state together with when it became
-// ready. Both fields are read at once, so they never disagree.
+// ready. All fields are read at once, so they never disagree.
 type Status struct {
 	State ProcessState
 	// ReadySince is when the process last entered StateReady. It is the zero
 	// time unless State is StateReady.
 	ReadySince time.Time
+	// Loading is the latest loading progress the upstream reported through
+	// its health check. Only set while State is StateStarting.
+	Loading *LoadingProgress
+	// Upstream is the server family detected when the process became ready,
+	// or hint.Unknown before detection finishes or when it failed. Only set
+	// while State is StateReady.
+	Upstream hint.Upstream
 }
 
 type Process interface {

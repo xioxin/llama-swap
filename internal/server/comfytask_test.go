@@ -58,7 +58,8 @@ func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 		case comfy.StatusCancelled:
 			msg = `[["execution_interrupted",{}]]`
 		}
-		_, _ = w.Write([]byte(`{"` + id + `":{"status":{"completed":true,"status_str":"success","messages":` + msg + `}}}`))
+		_, _ = w.Write([]byte(`{"` + id + `":{"status":{"completed":true,"status_str":"success","messages":` + msg + `},` +
+			`"outputs":{"47":{"images":[{"filename":"a.png","subfolder":"","type":"output"}]}}}}`))
 	})
 	f.srv = httptest.NewServer(mux)
 	return f
@@ -467,5 +468,55 @@ func TestComfyTask_NotYetRegisteredIsNotCancelled(t *testing.T) {
 	entries := listActivity(t, s)
 	if entries[0].Metadata[metaComfyStatus] != string(comfy.StatusRunning) {
 		t.Errorf("status = %q, want running (still awaiting registration)", entries[0].Metadata[metaComfyStatus])
+	}
+}
+
+// TestComfyTask_TrackStoresCapture proves a tracked workflow records a capture
+// ID on its activity row and stores the ComfyUI snapshot under it when
+// captures are enabled.
+func TestComfyTask_TrackStoresCapture(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+
+	cfg := config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	}
+	s := newTestServerWithConfig(cfg, nil, nil)
+	defer s.store.Close()
+	// newTestServerWithConfig builds its metrics monitor with captures off, so
+	// replace it with one bound to the same store and captures enabled.
+	s.metrics = newMetricsMonitor(s.logs.ProxyLogs, 0, 5, s.store)
+	defer s.metrics.Close()
+
+	row := store.ActivityLogEntry{
+		Timestamp: time.Now(),
+		Model:     config.ComfyUIModelID,
+		ReqPath:   comfyPromptPath,
+	}
+	newComfyTaskTracker(s).track(row, "abc")
+
+	deadline := time.Now().Add(2 * time.Second)
+	var captureID string
+	for time.Now().Before(deadline) {
+		entries := listActivity(t, s)
+		if len(entries) == 1 && entries[0].CaptureID != "" {
+			captureID = entries[0].CaptureID
+			if _, _, _, found := s.metrics.readCapture(captureID); found {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if captureID == "" {
+		t.Fatal("tracked activity row has no capture ID")
+	}
+	kind, snap, _, found := s.metrics.readCapture(captureID)
+	if !found {
+		t.Fatalf("capture %q not found", captureID)
+	}
+	if kind != CaptureKindComfy || snap == nil || snap.PromptID != "abc" {
+		t.Fatalf("readCapture(%q) = kind %q snap %+v, want comfy for abc", captureID, kind, snap)
 	}
 }

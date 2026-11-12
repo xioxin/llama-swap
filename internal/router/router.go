@@ -74,4 +74,9 @@ type LocalRouter interface {
 	// QueuedSnapshot returns an ordered, read-only view of the scheduler's
 	// request queue and the model the head would swap in next.
 	QueuedSnapshot() scheduler.QueueSnapshot
+
+	// SetStartGate installs a check that runs before the router starts any
+	// process. While it returns an error no model starts, and the requests
+	// that needed one get that error.
+	SetStartGate(gate func() error)
 }

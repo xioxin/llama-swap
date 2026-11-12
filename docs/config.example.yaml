@@ -19,6 +19,9 @@
 # healthCheckTimeout: number of seconds to wait for a model to be ready to serve requests
 # - optional, default: 120
 # - minimum value is 15 seconds, anything less will be set to this value
+# - when the health check reports loading progress, the countdown restarts each
+#   time the progress value changes, so this limits how long a load may go
+#   without progress
 healthCheckTimeout: 500
 
 # logLevel: sets the logging value
@@ -52,8 +55,15 @@ logToStdout: "proxy"
 # - optional, default: in-memory sqlite database capped by metricsMaxInMemory
 # - path is a sqlite database file path
 # - file-backed sqlite keeps activity logs across restarts
+# - persistCaptures: keep request/response captures in a second sqlite file
+#   next to path, named with _captures added to the base name, so
+#   /path/to/file.sqlite stores captures in /path/to/file_captures.sqlite
+#   - optional, default: false (captures are kept in memory)
+#   - total size is capped by captureBuffer; the oldest captures are deleted
+#   - keep or move the two files together
 # store:
 #   path: /path/to/file.sqlite
+#   persistCaptures: true
 
 # metricsMaxInMemory: maximum number of metrics to keep in memory
 # - optional, default: 1000
@@ -62,9 +72,10 @@ logToStdout: "proxy"
 # - when persistent sqlite storage is defined in store.path this has no effect
 metricsMaxInMemory: 1000
 
-# captureBuffer: how many MBs to allocate for storing request/response captures
-# - optional, default: 10
+# captureBuffer: how many MBs of compressed request/response captures to keep
+# - optional, default: 5
 # - set to 0 to disable
+# - also caps the captures database file when store.persistCaptures is true
 captureBuffer: 15
 
 # ui.activity.session_id: ordered request headers used to identify sessions in
@@ -88,9 +99,19 @@ performance:
   # - minimum duration 5s
   every: 15s
 
+# helpagent: the UI's Help page, a chat that answers questions about llama-swap
+# from its documentation, configuration and source code
+helpagent:
+  # disable: boolean
+  # - optional, default: false
+  # - true hides Help in the UI and does not serve the /api/mcp endpoint
+  #   whose tools the Help page uses
+  disable: false
+
 # startPort: sets the starting port number for the automatic ${PORT} macro.
 # - optional, default: 5800
-# - the ${PORT} macro can be used in model.cmd and model.proxy settings
+# - the ${PORT} macro can be used in model.cmd, and elsewhere in that model once
+#   model.cmd uses it
 # - it is automatically incremented for every model that uses it
 startPort: 10001
 
@@ -100,6 +121,9 @@ startPort: 10001
 # - when true, a stream of loading messages will be sent to the client in the
 #   reasoning field so chat UIs can show that loading is in progress.
 # - see #366 for more details
+# - this is for chat clients. To show a real progress bar on the Models page,
+#   have your server report progress from its checkEndpoint: see the "Loading
+#   progress" section of guides/model-runtime/writing-cmd.
 sendLoadingState: true
 
 # includeAliasesInList: present aliases within the /v1/models OpenAI API listing
@@ -129,6 +153,14 @@ unloadTimeout: 10
 #   response immediately, rather than being queued
 # - see issue #1086
 globalConcurrencyLimit: 0
+
+# maxRequestBodyMB: maximum size, in megabytes, of a request body sent to a
+# model endpoint (chat, completions, embeddings, audio, images, etc.)
+# - optional, default: 250
+# - must be 1 or more
+# - larger requests receive an HTTP 413 Request Entity Too Large response
+# - raise it for large audio uploads or many base64 images in one request
+maxRequestBodyMB: 250
 
 # macros: a dictionary of string substitutions
 # - optional, default: empty dictionary
@@ -394,6 +426,18 @@ models:
       --ctx-size ${default_ctx}
       --temperature ${temp}
 
+    # capacities: resource requirements for use: capacity
+    # - optional, default: empty dictionary (no declared usage)
+    # - keys name routing.router.settings.capacity.pools; omitted pools use zero
+    # - values: nonnegative integers in the corresponding pool's unit
+    # capacities:
+    #   ram: 18000
+    #   gpu0: 12000
+
+    # evict_cost: manual eviction preference for the capacity router
+    # - optional, default: 0; nonnegative integer; higher favors keeping resident
+    # evict_cost: 10
+
     # name: a display name for the model
     # - optional, default: empty string
     # - if set, it will be used in the v1/models API response
@@ -423,6 +467,9 @@ models:
     # - optional, default: /health
     # - endpoint is expected to return an HTTP 200 response
     # - all requests wait until the endpoint is ready or fails
+    # - while loading, a non-200 response with a JSON body like
+    #   {"progress": 0.42, "message": "loading tensors"} reports loading progress
+    #   (progress is 0 to 1) that is shown in the UI
     # - use "none" to skip endpoint health checking
     checkEndpoint: /custom-endpoint
 
@@ -511,6 +558,8 @@ models:
     # - optional, default: empty dictionary
     # - while metadata can contains complex types it is recommended to keep it simple
     # - metadata is only passed through in /v1/models responses
+    # - it appears under meta.llamaswap and is never filtered, even when a key
+    #   shares a name with a generated field such as context_window
     metadata:
       # port will remain an integer
       port: ${PORT}
@@ -561,6 +610,15 @@ models:
       tlsHandshake: 10
       idleConn: 90
 
+    # disableKeepAlives: open a new upstream connection for every request
+    # - optional, default: false
+    # - works around upstreams that advertise keep-alive and then close the
+    #   connection, such as llama-server after a streamed response (#1205).
+    #   Symptom: a request right after a stream fails with 502 "proxy error: EOF"
+    # - when true, idle connections are never pooled, so timeouts.idleConn has
+    #   no effect for this model
+    disableKeepAlives: false
+
     # capabilities: defines what the model accepts for input, output and other metadata
     # - optional; omitted or all-zero means no capabilities
     # - used in v1/models to inform clients what the model can do
@@ -579,7 +637,8 @@ models:
         - image
       # out: list of modalities generated by the model
       # - default: []
-      # - valid: text, audio, image, video
+      # - valid: text, audio, image, video, decisions
+      # - decisions: a llama.cpp decision model, served on /v1/systemone
       out:
         - text
         - audio
@@ -596,6 +655,19 @@ models:
       # - default: 0
       # - must be an integer > 0
       context: 32000
+
+      # voices: list of voice names for a speech model
+      # - default: []
+      # - an override for GET /v1/audio/voices?model={id}
+      # - when set, these are returned instead of asking the upstream server,
+      #   and the model is not started to answer
+      # - when empty or unset, the request goes to the upstream server
+      # - the response is {"voices": [...], "model": "{id}"}
+      # - not discovered and not shown in v1/models
+      voices:
+        - voicea
+        - voiceb
+        - voicec
 
       # disableAuto: turn off automatic capability discovery for this model
       # - default: false
@@ -657,7 +729,7 @@ hooks:
 
 # routing:
 # Controls how llama-swap decides which models can run at the same time and
-# which get swapped out. Choose one of two swap engines:
+# which get swapped out. Choose one of three swap engines:
 #
 # - group:  the default engine. Simpler to configure. You define groups of
 #           models that run together, and loading one group typically unloads
@@ -668,16 +740,34 @@ hooks:
 #           model combinations are allowed to run concurrently, enabling
 #           setups that groups cannot express.
 #
+# - capacity: declare resource pools and each local model's requirements.
+#             Any combination that fits every pool's limit may coexist.
+#
 # The routing section is optional.
 routing:
   router:
     # use: a string defining which engine to use
     # - optional, default: "group"
-    # - valid values: group, matrix
+    # - valid values: group, matrix, capacity
     use: group
 
     # settings: a dictionary of settings for the specific engines
     settings:
+      # capacity: independent resource limits (no automatic measurement)
+      # - used when routing.router.use is capacity; other settings may remain
+      # - cannot combine with legacy top-level groups/matrix either
+      # - pools: dictionary of names to positive integer limits
+      # - units are operator-chosen per pool, matching models.*.capacities
+      # - unknown pools, requirements exceeding a limit, and invalid values fail
+      # - minimizes summed evict_cost, then eviction count, then sorted IDs;
+      #   a bounded search may return a feasible nonoptimal plan
+      # - only resident models are searched; only the requested model is started
+      # capacity:
+      #   pools:
+      #     ram: 128000
+      #     gpu0: 24000
+      #     gpu1: 24000
+
       # groups: a dictionary of named groups
       # - optional, default: empty dictionary
       # - lets you keep some models loaded while others swap out
@@ -793,6 +883,13 @@ routing:
         #   "(a | b) & (c | d)"  → [a,c], [a,d], [b,c], [b,d]
         #   "+llms & v"          → inline the llms set, then AND with v
         sets:
+          # +auto:orphans includes each model that is not a leaf in a set.
+          # If you define a set with this name, llama-swap uses your set.
+          # Example of a catch-all set:
+          # always: "task-small & embed-model"
+          # main: "+always & moe-medium & (dense-a | dense-b)"
+          # scratch: "+always & +auto:orphans"
+
           # An LLM plus TTS. Vars and real model IDs may be mixed.
           # expands to: [g,v], [qwen-model,v], [m,v]
           standard: "(g | qwen-model | m) & v"

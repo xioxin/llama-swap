@@ -210,6 +210,27 @@ func parseKeyValues(entries []string, what string) (map[string]string, error) {
 	return out, nil
 }
 
+// parseAnnotations parses repeated "K=V" entries, validating K with the
+// API server's own annotation key rule (the label-key rule, case-
+// insensitive — objectmeta.ValidateAnnotations lowercases before checking)
+// so bad keys fail at flag parse instead of at Deployment creation.
+// Values are free-form: they may contain '=', spaces and be any length
+// (the API server's cap is the 256KiB total per object).
+func parseAnnotations(entries []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, e := range entries {
+		k, v, ok := strings.Cut(e, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid --annotation %q (want key=value)", e)
+		}
+		if errs := content.IsLabelKey(strings.ToLower(k)); len(errs) > 0 {
+			return nil, fmt.Errorf("invalid --annotation key %q: %v", k, errs)
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
 // parseGPUs parses "resource=count" entries like "amd.com/gpu=1"; the count
 // is a positive whole number — GPUs are exclusive, non-shareable devices, so
 // fractions and words like "many" are errors, not quantities.
@@ -225,6 +246,40 @@ func parseGPUs(entries []string) (map[string]string, error) {
 			return nil, fmt.Errorf("invalid --gpu %q: count %q must be a positive whole number", e, count)
 		}
 		out[res] = count
+	}
+	return out, nil
+}
+
+// resourceClaimSpec is one parsed --resource-claim entry: the pod-level
+// claim name and the existing ResourceClaim it references.
+type resourceClaimSpec struct {
+	Name  string
+	Claim string
+}
+
+// parseResourceClaims parses "name=claim" entries, validating both with
+// the API server's own rules: the pod-level name is a DNS-1123 label and
+// the ResourceClaim name a DNS-1123 subdomain. Pod claim names must be
+// unique within the pod, so a repeated name is rejected.
+func parseResourceClaims(entries []string) ([]resourceClaimSpec, error) {
+	out := make([]resourceClaimSpec, 0, len(entries))
+	seen := map[string]bool{}
+	for _, e := range entries {
+		name, claim, ok := strings.Cut(e, "=")
+		if !ok {
+			return nil, fmt.Errorf("invalid --resource-claim %q (want name=claim, e.g. gpu=my-gpu-claim)", e)
+		}
+		if errs := content.IsDNS1123Label(name); len(errs) > 0 {
+			return nil, fmt.Errorf("invalid --resource-claim name %q: %v", name, errs)
+		}
+		if errs := content.IsDNS1123Subdomain(claim); len(errs) > 0 {
+			return nil, fmt.Errorf("invalid --resource-claim claim %q: %v", claim, errs)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate --resource-claim name %q", name)
+		}
+		seen[name] = true
+		out = append(out, resourceClaimSpec{Name: name, Claim: claim})
 	}
 	return out, nil
 }
@@ -342,6 +397,7 @@ const (
 	volPVC      volumeKind = "pvc"
 	volEmptyDir volumeKind = "emptydir"
 	volHostPath volumeKind = "hostpath"
+	volNFS      volumeKind = "nfs"
 )
 
 // volumeSpec is one parsed --volume entry: kind:name:path[:ro].
@@ -352,23 +408,29 @@ type volumeSpec struct {
 	ReadOnly bool
 }
 
-// parseVolumes parses "kind:name:path[:ro]" entries. kind is pvc, emptydir or
-// hostpath; for hostpath the "name" field is the path on the host.
+// parseVolumes parses "kind:name:path[:ro]" entries. kind is pvc, emptydir,
+// hostpath or nfs; for hostpath the "name" field is the path on the host, for
+// nfs it is the server followed by the absolute export path (server/export).
 func parseVolumes(entries []string) ([]volumeSpec, error) {
 	out := make([]volumeSpec, 0, len(entries))
 	for _, e := range entries {
 		fields := strings.Split(e, ":")
 		if len(fields) < 3 || len(fields) > 4 {
-			return nil, fmt.Errorf("invalid --volume %q (want pvc|emptydir|hostpath:name:path[:ro])", e)
+			return nil, fmt.Errorf("invalid --volume %q (want pvc|emptydir|hostpath|nfs:name:path[:ro])", e)
 		}
 		kind := volumeKind(fields[0])
 		switch kind {
-		case volPVC, volEmptyDir, volHostPath:
+		case volPVC, volEmptyDir, volHostPath, volNFS:
 		default:
-			return nil, fmt.Errorf("invalid --volume kind %q (want pvc, emptydir or hostpath)", fields[0])
+			return nil, fmt.Errorf("invalid --volume kind %q (want pvc, emptydir, hostpath or nfs)", fields[0])
 		}
 		if fields[1] == "" || fields[2] == "" {
 			return nil, fmt.Errorf("invalid --volume %q (name and mount path are required)", e)
+		}
+		if kind == volNFS {
+			if server, export := nfsSource(fields[1]); server == "" || export == "/" {
+				return nil, fmt.Errorf("invalid --volume %q (nfs source must be server/export)", e)
+			}
 		}
 		spec := volumeSpec{Kind: kind, Name: fields[1], Path: fields[2]}
 		if len(fields) == 4 {
@@ -380,6 +442,13 @@ func parseVolumes(entries []string) ([]volumeSpec, error) {
 		out = append(out, spec)
 	}
 	return out, nil
+}
+
+// nfsSource splits an nfs volume source "server/export" into the server and
+// the absolute export path.
+func nfsSource(source string) (server, export string) {
+	server, export, _ = strings.Cut(source, "/")
+	return server, "/" + export
 }
 
 // sortedKeys returns keys in stable order (deterministic manifests).

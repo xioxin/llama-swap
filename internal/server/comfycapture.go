@@ -6,10 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/store"
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
@@ -85,27 +85,27 @@ func (s *Server) handleAPIComfyView(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-// handleAPICapture returns the stored capture for a metric (activity row) ID.
-// ComfyUI rows return a workflow/output snapshot (kind "comfy"); other rows
-// return the request/response capture (kind "reqresp"). The kind field lets the
-// UI pick the right renderer.
+// handleAPICapture returns the stored capture for a capture ID recorded on an
+// activity row. ComfyUI rows return a workflow/output snapshot (kind "comfy");
+// other rows return the request/response capture (kind "reqresp"). The kind
+// field lets the UI pick the right renderer.
 func (s *Server) handleAPICapture(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
+	id := r.PathValue("id")
+	if !store.ValidCaptureID(id) {
 		swaputil.SendResponse(w, r, http.StatusBadRequest, "invalid capture ID")
 		return
 	}
 
-	if cap := s.metrics.getComfyCaptureByID(id); cap != nil {
-		writeCapture(w, CaptureKindComfy, cap)
-		return
-	}
-	capture := s.metrics.getCaptureByID(id)
-	if capture == nil {
+	kind, comfyCap, reqResp, found := s.metrics.readCapture(id)
+	if !found {
 		swaputil.SendResponse(w, r, http.StatusNotFound, "capture not found")
 		return
 	}
-	writeCapture(w, CaptureKindReqResp, capture)
+	if kind == CaptureKindComfy {
+		writeCapture(w, CaptureKindComfy, comfyCap)
+		return
+	}
+	writeCapture(w, CaptureKindReqResp, reqResp)
 }
 
 // captureEnvelope tags a capture payload with its kind so the client can

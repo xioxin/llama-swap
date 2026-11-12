@@ -147,7 +147,7 @@
                 },
                 "sets": {
                     "type": "object",
-                    "description": "Named sets of concurrent model combinations. Values are DSL strings using & (AND), | (OR), () (grouping), and +ref (inline another set). Definition order is used for tie-breaking.",
+                    "description": "Named sets of concurrent model combinations. Values are DSL strings using & (AND), | (OR), () (grouping), +ref (inline another set), and +auto:orphans (each model that is not a leaf in a set). Definition order is used for tie-breaking.",
                     "minProperties": 1,
                     "additionalProperties": {
                         "type": "string"
@@ -162,7 +162,7 @@
             "type": "integer",
             "minimum": 15,
             "default": 120,
-            "description": "Number of seconds to wait for a model to be ready to serve requests."
+            "description": "Number of seconds to wait for a model to be ready to serve requests. When the health check reports loading progress, the countdown restarts each time the progress value changes."
         },
         "globalTTL": {
             "type": "integer",
@@ -181,6 +181,12 @@
             "minimum": 0,
             "default": 0,
             "description": "Caps the number of inference requests served at once across all models combined, using a single shared semaphore rather than a per-model limit. 0 means no limit. Requests exceeding the limit receive an HTTP 429 Too Many Requests response immediately rather than being queued."
+        },
+        "maxRequestBodyMB": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 250,
+            "description": "Maximum size in megabytes of a request body sent to a model endpoint (chat, completions, embeddings, audio, images, etc.). Larger requests receive an HTTP 413 Request Entity Too Large response."
         },
         "logLevel": {
             "type": "string",
@@ -225,7 +231,7 @@
             "type": "integer",
             "minimum": 0,
             "default": 5,
-            "description": "Size in megabytes of the buffer for storing request/response captures. Set to 0 to disable captures."
+            "description": "Maximum size in megabytes of compressed request/response captures, in memory or in the database file used when store.persistCaptures is true. The oldest captures are deleted first. Set to 0 to disable captures."
         },
         "store": {
             "type": "object",
@@ -234,6 +240,11 @@
                     "type": "string",
                     "minLength": 1,
                     "description": "SQLite database file path for persistent activity logs."
+                },
+                "persistCaptures": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Keep request/response captures in a second SQLite file next to path, named with _captures added to its base name (metrics.db stores captures in metrics_captures.db). Total size is capped by captureBuffer."
                 }
             },
             "required": [
@@ -286,6 +297,19 @@
             "additionalProperties": false,
             "default": {},
             "description": "Configuration for CPU, RAM and GPU monitoring statistics."
+        },
+        "helpagent": {
+            "type": "object",
+            "properties": {
+                "disable": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Hide the UI's Help page and do not serve the /api/mcp endpoint its documentation, configuration and source code tools use."
+                }
+            },
+            "additionalProperties": false,
+            "default": {},
+            "description": "Configuration for the UI's Help page and the /api/mcp endpoint."
         },
         "startPort": {
             "type": "integer",
@@ -432,6 +456,25 @@
                     "macros": {
                         "$ref": "#/definitions/macros"
                     },
+                    "capacities": {
+                        "type": "object",
+                        "description": "Resource requirements for the capacity router, in each pool's units. Keys must name declared pools. Omitted pools consume zero; an omitted or empty dictionary declares no usage.",
+                        "default": {},
+                        "propertyNames": {"pattern": "\\S"},
+                        "additionalProperties": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9223372036854775807
+                        },
+                        "examples": [{"gpu0": 12, "ram": 128}]
+                    },
+                    "evict_cost": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854775807,
+                        "default": 0,
+                        "description": "Manual cost of evicting this model in the capacity router. Higher costs favor retention. Minimize summed cost, then eviction count, then sorted model IDs; a bounded search may return a feasible nonoptimal plan."
+                    },
                     "cmd": {
                         "type": "string",
                         "minLength": 1,
@@ -482,7 +525,7 @@
                         "type": "string",
                         "default": "/health",
                         "pattern": "^/.*$|^none$",
-                        "description": "URL path to check if the server is ready. Use 'none' to skip health checking."
+                        "description": "URL path to check if the server is ready. Use 'none' to skip health checking. A non-200 response with a JSON body like {\"progress\": 0.42, \"message\": \"...\"} reports loading progress."
                     },
                     "ttl": {
                         "type": "integer",
@@ -554,6 +597,11 @@
                     "timeouts": {
                         "$ref": "#/definitions/timeouts"
                     },
+                    "disableKeepAlives": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Open a new upstream connection for every request instead of reusing idle ones. Works around upstreams that close a connection they advertised as keep-alive, such as llama-server after a streamed response (#1205). When true, timeouts.idleConn has no effect."
+                    },
                     "compat": {
                         "type": "object",
                         "properties": {
@@ -597,7 +645,8 @@
                                         "text",
                                         "audio",
                                         "image",
-                                        "video"
+                                        "video",
+                                        "decisions"
                                     ]
                                 },
                                 "description": "List of output modalities generated by the model."
@@ -612,11 +661,25 @@
                                 "default": false,
                                 "description": "Whether the model supports the /v1/rerank endpoint."
                             },
+                            "embeddings": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Whether the model serves the /v1/embeddings endpoint. Not auto-discovered; set it for embedding models so clients can tell them from chat models."
+                            },
                             "context": {
                                 "type": "integer",
                                 "minimum": 0,
                                 "default": 0,
                                 "description": "Maximum token context length supported by the model."
+                            },
+                            "voices": {
+                                "type": "array",
+                                "uniqueItems": true,
+                                "default": [],
+                                "items": {
+                                    "type": "string"
+                                },
+                                "description": "Override for GET /v1/audio/voices?model={id}. When set, this list is returned instead of asking the upstream server and the model is not started to answer. When empty, the request goes to the upstream server."
                             },
                             "disableAuto": {
                                 "type": "boolean",
@@ -995,16 +1058,17 @@
                 },
                 "router": {
                     "type": "object",
-                    "description": "Router configuration. Selects between the group and matrix swapping strategies.",
+                    "description": "Router configuration. Selects group, matrix, or capacity swapping.",
                     "properties": {
                         "use": {
                             "type": "string",
                             "enum": [
                                 "group",
-                                "matrix"
+                                "matrix",
+                                "capacity"
                             ],
                             "default": "group",
-                            "description": "Router to use. 'group' uses static groups, 'matrix' uses the solver-based swap matrix."
+                            "description": "Router to use. 'group' uses static groups, 'matrix' uses allowed combinations, 'capacity' uses declared resource pools."
                         },
                         "settings": {
                             "type": "object",
@@ -1014,18 +1078,71 @@
                                 },
                                 "matrix": {
                                     "$ref": "#/definitions/matrixConfig"
+                                },
+                                "capacity": {
+                                    "type": "object",
+                                    "description": "Independent resource limits in operator-chosen integer units. Model capacities use the same units as their referenced pools. No automatic measurement.",
+                                    "required": ["pools"],
+                                    "properties": {
+                                        "pools": {
+                                            "type": "object",
+                                            "minProperties": 1,
+                                            "propertyNames": {"pattern": "\\S"},
+                                            "additionalProperties": {
+                                                "type": "integer",
+                                                "minimum": 1,
+                                                "maximum": 9223372036854775807
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false
                                 }
                             },
                             "additionalProperties": false
                         }
                     },
-                    "additionalProperties": false
+                    "additionalProperties": false,
+                    "allOf": [
+                        {
+                            "if": {
+                                "required": ["use"],
+                                "properties": {"use": {"const": "capacity"}}
+                            },
+                            "then": {
+                                "required": ["settings"],
+                                "properties": {
+                                    "settings": {
+                                        "required": ["capacity"]
+                                    }
+                                }
+                            }
+                        }
+                    ]
                 }
             },
             "additionalProperties": false
         }
     },
     "allOf": [
+        {
+            "if": {
+                "required": ["routing"],
+                "properties": {
+                    "routing": {
+                        "required": ["router"],
+                        "properties": {
+                            "router": {
+                                "required": ["use"],
+                                "properties": {"use": {"const": "capacity"}}
+                            }
+                        }
+                    }
+                }
+            },
+            "then": {
+                "not": {"anyOf": [{"required": ["groups"]}, {"required": ["matrix"]}]}
+            }
+        },
         {
             "if": {
                 "required": [

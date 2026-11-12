@@ -124,6 +124,11 @@ func (t *comfyTaskTracker) track(row store.ActivityLogEntry, promptID string) {
 	// Terminal status is unknown until the workflow finishes.
 	row.Metadata[metaComfyStatus] = string(comfy.StatusRunning)
 
+	// Reserve the capture ID now so the activity listing can report
+	// has_capture once finalize writes the snapshot. Empty when captures are
+	// disabled.
+	row.CaptureID = t.server.metrics.newCaptureID(row.Timestamp)
+
 	stored, ok := t.server.metrics.queueMetrics(row)
 	if !ok {
 		return
@@ -204,9 +209,9 @@ func (t *comfyTaskTracker) finalize(row store.ActivityLogEntry, promptID string,
 	// and model list) into the capture store so the Capture view stays usable
 	// after ComfyUI restarts or clears its history. Output media is not stored;
 	// it is proxied from ComfyUI on demand.
-	if status.IsTerminal() {
+	if status.IsTerminal() && row.CaptureID != "" {
 		if snap := t.snapshot(ctx, promptID); snap != nil {
-			t.server.metrics.addComfyCapture(row.ID, snap)
+			t.server.metrics.addComfyCapture(row.CaptureID, snap)
 		}
 	}
 

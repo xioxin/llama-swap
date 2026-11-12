@@ -11,10 +11,13 @@ export interface ModelCapabilities {
   image_to_image?: boolean;
   function_calling?: boolean;
   reranker?: boolean;
+  embeddings?: boolean;
+  decisions?: boolean;
 }
 
 // Input/output modalities a model reports through the /v1/models
-// architecture block. Values are "text", "audio", "image" or "video".
+// architecture block. Values are "text", "audio", "image" or "video"; an
+// output can also be "decisions" for a model that only answers /v1/systemone.
 export interface ModelModalities {
   in: string[];
   out: string[];
@@ -39,6 +42,11 @@ export interface Model {
   // client-only: when the model became ready by this browser's clock,
   // derived from uptimeMs on receipt so server clock skew doesn't matter
   readyAt?: number;
+  // fraction loaded (0 to 1) the upstream last reported through its health
+  // check; only set while starting and the upstream reports progress
+  loadingProgress?: number;
+  // the loading step the upstream last reported; only set while starting
+  loadingMessage?: string;
   // selector-only fields from the v1/models llamaswap metadata
   strategy?: string;
   targets?: string[];
@@ -71,11 +79,13 @@ export interface ActivityLogEntry {
   timestamp: string;
   src: string;
   model: string;
+  task?: string;
   req_path: string;
   resp_content_type: string;
   resp_status_code: number;
   tokens: TokenMetrics;
   duration_ms: number;
+  capture_id?: string;
   has_capture: boolean;
   error_msg?: string;
   metadata?: Record<string, string>;
@@ -180,6 +190,10 @@ export interface UIConfig {
   activity: {
     session_id: string[];
   };
+  /** helpagent.disable hides the Help page; the server then has no /api/mcp. */
+  helpagent?: {
+    disable: boolean;
+  };
 }
 
 export interface NetIOStat {
@@ -223,7 +237,7 @@ export interface PerformanceResponse {
 }
 
 export interface APIEventEnvelope {
-  type: "modelStatus" | "logData" | "activity" | "inflight" | "uiConfig" | "profileChanged" | "perfsys" | "perfgpu";
+  type: "modelStatus" | "logData" | "activity" | "inflight" | "uiConfig" | "profileChanged" | "pauseChanged" | "perfsys" | "perfgpu";
   data: string;
 }
 

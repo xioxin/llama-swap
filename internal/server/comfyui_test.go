@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -42,8 +43,8 @@ func TestServer_HandleComfyUI(t *testing.T) {
 			if w.Code != tt.status {
 				t.Errorf("%s status=%d want %d", tt.method, w.Code, tt.status)
 			}
-			if got := w.Header().Get("Location"); got != "/comfyui/?token=value" {
-				t.Errorf("%s Location=%q want /comfyui/?token=value", tt.method, got)
+			if got := w.Header().Get("Location"); got != "comfyui/?token=value" {
+				t.Errorf("%s Location=%q want comfyui/?token=value", tt.method, got)
 			}
 		}
 	})
@@ -464,5 +465,31 @@ func TestServer_ComfyUIIgnorePaths(t *testing.T) {
 		if got := comfyUIIgnoresPath(tt.path); got != tt.want {
 			t.Errorf("comfyUIIgnoresPath(%q) = %v, want %v", tt.path, got, tt.want)
 		}
+	}
+}
+
+// TestServer_ComfyUI_PausedRejects proves both ComfyUI surfaces turn requests
+// away while inference is paused instead of cold-starting the model.
+func TestServer_ComfyUI_PausedRejects(t *testing.T) {
+	local := newStubRouter([]string{config.ComfyUIModelID}, "")
+	var served atomic.Int32
+	local.serveHTTP = func(w http.ResponseWriter, r *http.Request) { served.Add(1) }
+
+	s := newTestServer(local, newStubRouter(nil, ""))
+	defer s.store.Close()
+	s.cfg = config.Config{Models: map[string]config.ModelConfig{config.ComfyUIModelID: {}}}
+	s.routes()
+	s.pause.paused.Store(true)
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", nil))
+	assertPausedResponse(t, w)
+
+	w = httptest.NewRecorder()
+	s.ServeComfyUIPort(w, httptest.NewRequest(http.MethodPost, "/prompt", nil))
+	assertPausedResponse(t, w)
+
+	if got := served.Load(); got != 0 {
+		t.Errorf("local router served %d requests while paused, want 0", got)
 	}
 }

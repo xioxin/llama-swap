@@ -76,6 +76,16 @@ func TestKubeswap_ServeFlagsValidation(t *testing.T) {
 	if err := badPath.validateServeFlags(); err == nil || !strings.Contains(err.Error(), "must start with /") {
 		t.Errorf("bad path: %v", err)
 	}
+	badSA := *base
+	badSA.serviceAccount = "BAD SA"
+	if err := badSA.validateServeFlags(); err == nil || !strings.Contains(err.Error(), "invalid --service-account") {
+		t.Errorf("bad service account: %v", err)
+	}
+	goodSA := *base
+	goodSA.serviceAccount = "my-sa"
+	if err := goodSA.validateServeFlags(); err != nil {
+		t.Errorf("valid service account: %v", err)
+	}
 }
 
 // TestKubeswap_ToConfigRejectsReservedLabels Verifies managed label keys are rejected as extra labels.
@@ -93,6 +103,39 @@ func TestKubeswap_ToConfigRejectsReservedLabels(t *testing.T) {
 	}
 	if cfg.ExtraLabels["team"] != "ml" || cfg.ExtraLabels["note"] != "dev" {
 		t.Errorf("got %v", cfg.ExtraLabels)
+	}
+}
+
+// TestKubeswap_ToConfigRejectsReservedAnnotations Verifies the managed
+// model-id annotation key is rejected as an extra annotation.
+func TestKubeswap_ToConfigRejectsReservedAnnotations(t *testing.T) {
+	f := &serveFlags{model: "m", annotations: stringList{annotationModelID + "=other"}}
+	if _, err := f.toConfig(); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Errorf("got %v, want reserved-key error", err)
+	}
+	f = &serveFlags{model: "m", annotations: stringList{"team=ml", "note=dev"}}
+	cfg, err := f.toConfig()
+	if err != nil {
+		t.Fatalf("non-reserved annotations should pass: %v", err)
+	}
+	if cfg.ExtraAnnotations["team"] != "ml" || cfg.ExtraAnnotations["note"] != "dev" {
+		t.Errorf("got %v", cfg.ExtraAnnotations)
+	}
+}
+
+// TestKubeswap_ToConfigResourceClaims Verifies --resource-claim reaches the config and invalid entries fail at parse time.
+func TestKubeswap_ToConfigResourceClaims(t *testing.T) {
+	f := &serveFlags{model: "m", resourceClaims: stringList{"gpu=pro2000"}}
+	cfg, err := f.toConfig()
+	if err != nil {
+		t.Fatalf("toConfig: %v", err)
+	}
+	if len(cfg.ResourceClaims) != 1 || cfg.ResourceClaims[0] != (resourceClaimSpec{Name: "gpu", Claim: "pro2000"}) {
+		t.Errorf("got %v", cfg.ResourceClaims)
+	}
+	f = &serveFlags{model: "m", resourceClaims: stringList{"gpu=a", "gpu=b"}}
+	if _, err := f.toConfig(); err == nil || !strings.Contains(err.Error(), "--resource-claim") {
+		t.Errorf("duplicate name: got %v, want --resource-claim error", err)
 	}
 }
 
