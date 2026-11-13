@@ -162,13 +162,10 @@ can start a workflow while a mutually exclusive model holds the GPU.
 
 ## Task visibility
 
-Two places show ComfyUI workflow tasks:
-
-- **Activity panel → ComfyUI Tasks**: live queued/running prompts plus recent
-  finished ones, each with its state (`queued`, `running`, `completed`,
-  `failed`, `cancelled`) and duration.
-- **`GET /api/comfy/jobs`**: the same merged list as JSON — live prompts from
-  ComfyUI's queue plus terminal states recorded by the task tracker.
+`GET /api/comfy/jobs` returns ComfyUI workflow tasks as JSON: live queued/running
+prompts plus recent finished ones, each with its state (`queued`, `running`,
+`completed`, `failed`, `cancelled`) and duration. The list merges live prompts
+from ComfyUI's queue with terminal states recorded by the task tracker.
 
 Each submitted workflow also appears as a row in the main Activity table (`model`
 `comfyui_auto`, path `/prompt`); its Status column shows the workflow's terminal
@@ -202,11 +199,10 @@ model), then renders the image or video.
 
 ## Request queue visibility
 
-The Activity panel also shows a **Request Queue** view: the requests waiting in
-llama-swap's FIFO scheduler, in order, each with its model, request path and
-wait time, and which model the head of the queue would swap in next. It answers
-"what is queued and what loads next". The same data is available as JSON at
-`GET /api/queue`. This is a read-only view — it never affects scheduling.
+`GET /api/queue` returns the requests waiting in llama-swap's FIFO scheduler, in
+order, each with its model, request path and wait time, and which model the head
+of the queue would swap in next. It answers "what is queued and what loads
+next". This is a read-only view — it never affects scheduling.
 
 ## What goes wrong
 

@@ -14,9 +14,7 @@ import type {
   PlaygroundModelType,
   HardwareSnapshot,
   TailcatStatus,
-  ComfyJob,
   CaptureEnvelope,
-  QueueSnapshot,
 } from "../lib/types";
 import { appendActivityFilters, type ActivityFilters } from "../lib/activityFilters";
 import { apiUrl } from "../lib/apiPath";
@@ -406,23 +404,6 @@ export async function getActivityStats(model?: string): Promise<ActivityStatsDat
     throw new Error(`Failed to fetch activity stats: ${response.status}`);
   }
   return await response.json();
-}
-
-export async function getQueue(): Promise<QueueSnapshot> {
-  const response = await fetch(apiUrl("/api/queue"));
-  if (!response.ok) {
-    throw new Error(`Failed to fetch queue: ${response.status}`);
-  }
-  return await response.json();
-}
-
-export async function getComfyJobs(): Promise<ComfyJob[]> {
-  const response = await fetch(apiUrl("/api/comfy/jobs"));
-  if (!response.ok) {
-    throw new Error(`Failed to fetch comfy jobs: ${response.status}`);
-  }
-  const payload = await response.json();
-  return (payload.jobs ?? []) as ComfyJob[];
 }
 
 export async function unloadAllModels(): Promise<void> {
