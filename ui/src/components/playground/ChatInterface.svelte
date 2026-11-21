@@ -9,11 +9,16 @@
   import { playgroundStores } from "../../stores/playgroundActivity";
   import type { ChatMessage, ContentPart } from "../../lib/types";
   import { isSubmitEnter } from "../../lib/ime";
+  import { appendImageFiles, pasteImageFiles } from "../../lib/chatImages";
   import ChatMessageComponent from "./ChatMessage.svelte";
   import ModelSelector from "./ModelSelector.svelte";
   import ChatComposer from "./ChatComposer.svelte";
   import EmptyState from "../EmptyState.svelte";
   import { Settings, Paperclip, SquarePen } from "@lucide/svelte";
+  import HistoryMenu from "./HistoryMenu.svelte";
+  import HistorySettings from "./HistorySettings.svelte";
+  import { createChatHistory } from "../../stores/chatHistory";
+  import { useConversation } from "../../lib/hooks/conversation.svelte";
   import { Button } from "$lib/components/ui/button/index.js";
   import { Input } from "$lib/components/ui/input/index.js";
   import { Textarea } from "$lib/components/ui/textarea/index.js";
@@ -25,6 +30,13 @@
 
   const selectedModelStore = persistentStore<string>("playground-selected-model", "");
   const systemPromptStore = persistentStore<string>("playground-system-prompt", "");
+  const parameterEnabledStore = persistentStore("playground-parameters-enabled", {
+    temperature: false,
+    topP: false,
+    minP: false,
+    topK: false,
+    maxTokens: false,
+  });
   const temperatureStore = persistentStore<number>("playground-temperature", 0.7);
   const endpointStore = persistentStore<Endpoint>("playground-endpoint", "v1/chat/completions");
   const maxTokensStore = persistentStore<number>("playground-max-tokens", 4096);
@@ -42,23 +54,29 @@
   /** Chat holds no tool turns; the Docs tab is where tool calling lives. */
   type PlainMessage = ChatMessage & { role: "user" | "assistant" | "system" };
 
-  function loadMessages(): PlainMessage[] {
-    try {
-      const saved = localStorage.getItem("playground-messages");
-      const parsed = saved ? JSON.parse(saved) : [];
-      if (!Array.isArray(parsed)) return [];
-      // A history left over from when this tab was agentic still holds tool
-      // turns this tab cannot render or replay. Sending one upstream is a hard
-      // 400, so they are dropped on load.
-      return parsed.filter(
-        (msg: ChatMessage): msg is PlainMessage => msg?.role !== "tool" && !msg?.tool_calls?.length
-      );
-    } catch {
-      return [];
-    }
+  /** What a saved conversation brings back with its messages. */
+  interface ChatSettings {
+    model: string;
+    systemPrompt: string;
+    endpoint: Endpoint;
+    parameterEnabled?: typeof $parameterEnabledStore;
+    temperature: number;
+    maxTokens: number;
+    topP: number;
+    topK: number;
+    minP: number;
   }
 
-  let messages = $state<PlainMessage[]>(loadMessages());
+  // Tool turns are not part of this tab; see PlainMessage. They are dropped
+  // when a conversation loads, since sending one upstream is a hard 400.
+  const history = createChatHistory<ChatSettings>({
+    namespace: "chat",
+    legacyKeys: ["playground-messages"],
+    defaultLimit: 1,
+    sanitize: (msgs) => msgs.filter((msg) => msg.role !== "tool" && !msg.tool_calls?.length),
+  });
+
+  let messages = $state<PlainMessage[]>([]);
   let userInput = $state("");
   let isStreaming = $state(false);
   let isReasoning = $state(false);
@@ -149,26 +167,66 @@
     }
   });
 
-  // Persist messages to localStorage (throttled to once per 2s)
-  let lastSaveTime = 0;
-  $effect(() => {
-    const json = JSON.stringify(messages);
-    const elapsed = Date.now() - lastSaveTime;
-    const save = () => {
-      try { localStorage.setItem("playground-messages", json); } catch {}
-      lastSaveTime = Date.now();
+  let historyNotice = $state<string | null>(null);
+
+  function currentSettings(): ChatSettings {
+    return {
+      model: $selectedModelStore,
+      systemPrompt: $systemPromptStore,
+      endpoint: $endpointStore,
+      parameterEnabled: { ...$parameterEnabledStore },
+      temperature: $temperatureStore,
+      maxTokens: $maxTokensStore,
+      topP: $topPStore,
+      topK: $topKStore,
+      minP: $minPStore,
     };
-    if (elapsed >= 2000) {
-      save();
-      return;
+  }
+
+  function applySettings(settings: ChatSettings) {
+    historyNotice = null;
+    const known = get(playgroundModels);
+    const gone =
+      Boolean(settings.model) &&
+      known.length > 0 &&
+      !known.some((m) => m.id === settings.model || m.aliases?.includes(settings.model));
+    if (gone) {
+      historyNotice = `Model "${settings.model}" is no longer available; using the selected model instead.`;
+    } else {
+      selectedModelStore.set(settings.model);
     }
-    const timer = setTimeout(save, 2000 - elapsed);
-    return () => clearTimeout(timer);
+    systemPromptStore.set(settings.systemPrompt);
+    endpointStore.set(settings.endpoint);
+    if (settings.parameterEnabled) parameterEnabledStore.set(settings.parameterEnabled);
+    temperatureStore.set(settings.temperature);
+    maxTokensStore.set(settings.maxTokens);
+    topPStore.set(settings.topP);
+    topKStore.set(settings.topK);
+    minPStore.set(settings.minP);
+  }
+
+  const conversation = useConversation<ChatSettings>({
+    history,
+    getMessages: () => messages,
+    setMessages: (next) => (messages = next as PlainMessage[]),
+    getSettings: currentSettings,
+    applySettings,
+    isStreaming: () => isStreaming,
   });
+
+  function selectHistory(id: string) {
+    void conversation.open(id).then((ok) => {
+      if (ok) {
+        isReasoning = false;
+        reasoningStartTime = 0;
+        userScrolledUp = false;
+      }
+    });
+  }
 
   async function sendMessage() {
     const trimmedInput = userInput.trim();
-    if ((!trimmedInput && attachedImages.length === 0) || !$selectedModelStore || isStreaming) return;
+    if ((!trimmedInput && attachedImages.length === 0) || !$selectedModelStore || isStreaming || conversation.loading) return;
 
     userScrolledUp = false;
 
@@ -205,7 +263,8 @@
     if (isStreaming) {
       cancelStreaming();
     }
-    messages = [];
+    historyNotice = null;
+    void conversation.newChat();
     isReasoning = false;
     reasoningStartTime = 0;
   }
@@ -307,12 +366,12 @@
         requestMessages(),
         abortController.signal,
         {
-          temperature: $temperatureStore,
           endpoint: $endpointStore,
-          max_tokens: $maxTokensStore,
-          top_p: $topPStore,
-          top_k: $topKStore,
-          min_p: $minPStore,
+          temperature: $parameterEnabledStore.temperature ? $temperatureStore : undefined,
+          top_p: $parameterEnabledStore.topP ? $topPStore : undefined,
+          top_k: $parameterEnabledStore.topK ? $topKStore : undefined,
+          min_p: $parameterEnabledStore.minP ? $minPStore : undefined,
+          max_tokens: $parameterEnabledStore.maxTokens ? $maxTokensStore : undefined,
         }
       );
 
@@ -337,7 +396,7 @@
   }
 
   async function editMessage(idx: number, newContent: string) {
-    if (isStreaming || !$selectedModelStore) return;
+    if (isStreaming || conversation.loading || !$selectedModelStore) return;
 
     // Update the user message at the specified index
     messages = messages.map((msg, i) =>
@@ -355,51 +414,12 @@
     }
   }
 
-  const ACCEPTED_IMAGE_FORMATS = ["image/jpeg", "image/png", "image/gif", "image/webp"];
-  const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
-  const MAX_IMAGES_PER_MESSAGE = 5;
-
-  function validateImageFile(file: File): string | null {
-    if (!ACCEPTED_IMAGE_FORMATS.includes(file.type)) {
-      return `Invalid file type: ${file.type}. Accepted formats: JPG, PNG, GIF, WEBP`;
-    }
-    if (file.size > MAX_IMAGE_SIZE) {
-      return `File too large: ${(file.size / 1024 / 1024).toFixed(1)}MB. Maximum size: 20MB`;
-    }
-    return null;
-  }
-
-  function fileToDataUrl(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result as string);
-      reader.onerror = () => reject(new Error("Failed to read file"));
-      reader.readAsDataURL(file);
-    });
-  }
-
   async function processImageFiles(files: File[]): Promise<void> {
     imageError = null;
-
-    if (attachedImages.length + files.length > MAX_IMAGES_PER_MESSAGE) {
-      imageError = `Maximum ${MAX_IMAGES_PER_MESSAGE} images per message`;
-      return;
-    }
-
-    for (const file of files) {
-      const error = validateImageFile(file);
-      if (error) {
-        imageError = error;
-        return;
-      }
-    }
-
-    try {
-      const dataUrls = await Promise.all(files.map(fileToDataUrl));
-      attachedImages = [...attachedImages, ...dataUrls];
-    } catch (error) {
-      imageError = error instanceof Error ? error.message : "Failed to process images";
-    }
+    const error = await appendImageFiles(files, () => attachedImages, (images) => {
+      attachedImages = images;
+    });
+    if (error) imageError = error;
   }
 
   function handleImageSelect(event: Event) {
@@ -411,6 +431,10 @@
     input.value = "";
   }
 
+  function handleImagePaste(event: ClipboardEvent) {
+    pasteImageFiles(event, processImageFiles);
+  }
+
   function removeImage(idx: number) {
     attachedImages = attachedImages.filter((_, i) => i !== idx);
     imageError = null;
@@ -420,6 +444,7 @@
 <div class="flex flex-col h-full">
   <!-- Model selector and controls -->
   <div class="mb-3 flex shrink-0 gap-2">
+    <HistoryMenu {history} disabled={isStreaming} onSelect={selectHistory} onCleared={conversation.detach} />
     <ModelSelector
       bind:value={$selectedModelStore}
       placeholder="Select a model..."
@@ -436,6 +461,10 @@
       </Button>
     </div>
   </div>
+
+  {#if historyNotice}
+    <p class="text-muted-foreground mb-2 shrink-0 px-1 text-xs">{historyNotice}</p>
+  {/if}
 
   <!-- Settings dialog -->
   <Dialog.Root bind:open={showSettings}>
@@ -454,6 +483,7 @@
         <TabsList variant="line" class="justify-start">
           <TabsTrigger value="prompt">Prompt</TabsTrigger>
           <TabsTrigger value="params">Parameters</TabsTrigger>
+          <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
         <TabsContent value="prompt">
@@ -485,9 +515,18 @@
             </Select.Root>
           </div>
           <div>
-            <Label class="mb-1" for="temperature">
-              Temperature: {$temperatureStore.toFixed(2)}
-            </Label>
+            <div class="mb-1 flex items-center justify-between gap-2">
+              <Label for="temperature">
+                Temperature: {$temperatureStore.toFixed(2)}
+              </Label>
+              <input
+                type="checkbox"
+                class="accent-primary"
+                aria-label="Enable Temperature"
+                bind:checked={$parameterEnabledStore.temperature}
+                disabled={isStreaming}
+              />
+            </div>
             <input
               id="temperature"
               type="range"
@@ -496,7 +535,7 @@
               step="0.05"
               class="accent-primary w-full"
               bind:value={$temperatureStore}
-              disabled={isStreaming}
+              disabled={isStreaming || !$parameterEnabledStore.temperature}
             />
             <div class="text-muted-foreground mt-1 flex justify-between text-xs">
               <span>Precise (0)</span>
@@ -504,9 +543,18 @@
             </div>
           </div>
           <div>
-            <Label class="mb-1" for="top-p">
-              Top P (nucleus): {$topPStore.toFixed(2)}
-            </Label>
+            <div class="mb-1 flex items-center justify-between gap-2">
+              <Label for="top-p">
+                Top P (nucleus): {$topPStore.toFixed(2)}
+              </Label>
+              <input
+                type="checkbox"
+                class="accent-primary"
+                aria-label="Enable Top P"
+                bind:checked={$parameterEnabledStore.topP}
+                disabled={isStreaming}
+              />
+            </div>
             <input
               id="top-p"
               type="range"
@@ -515,7 +563,7 @@
               step="0.01"
               class="accent-primary w-full"
               bind:value={$topPStore}
-              disabled={isStreaming}
+              disabled={isStreaming || !$parameterEnabledStore.topP}
             />
             <div class="text-muted-foreground mt-1 flex justify-between text-xs">
               <span>Narrow (0.01)</span>
@@ -523,9 +571,18 @@
             </div>
           </div>
           <div>
-            <Label class="mb-1" for="min-p">
-              Min P: {$minPStore.toFixed(2)}
-            </Label>
+            <div class="mb-1 flex items-center justify-between gap-2">
+              <Label for="min-p">
+                Min P: {$minPStore.toFixed(2)}
+              </Label>
+              <input
+                type="checkbox"
+                class="accent-primary"
+                aria-label="Enable Min P"
+                bind:checked={$parameterEnabledStore.minP}
+                disabled={isStreaming}
+              />
+            </div>
             <input
               id="min-p"
               type="range"
@@ -534,12 +591,21 @@
               step="0.01"
               class="accent-primary w-full"
               bind:value={$minPStore}
-              disabled={isStreaming}
+              disabled={isStreaming || !$parameterEnabledStore.minP}
             />
             <p class="text-muted-foreground mt-1 text-xs">Off at 0. Only sent on /v1/chat/completions.</p>
           </div>
           <div>
-            <Label class="mb-1" for="top-k">Top K</Label>
+            <div class="mb-1 flex items-center justify-between gap-2">
+              <Label for="top-k">Top K</Label>
+              <input
+                type="checkbox"
+                class="accent-primary"
+                aria-label="Enable Top K"
+                bind:checked={$parameterEnabledStore.topK}
+                disabled={isStreaming}
+              />
+            </div>
             <Input
               id="top-k"
               type="number"
@@ -547,15 +613,28 @@
               max="10000"
               step="1"
               bind:value={$topKStore}
-              disabled={isStreaming}
+              disabled={isStreaming || !$parameterEnabledStore.topK}
             />
             <p class="text-muted-foreground mt-1 text-xs">0 disables it. Not sent on /v1/responses.</p>
           </div>
           <div>
-            <Label class="mb-1" for="max-tokens">Max Tokens</Label>
-            <Input id="max-tokens" type="number" min="1" bind:value={$maxTokensStore} disabled={isStreaming} />
-            <p class="text-muted-foreground mt-1 text-xs">Required for /v1/messages.</p>
+            <div class="mb-1 flex items-center justify-between gap-2">
+              <Label for="max-tokens">Max Tokens</Label>
+              <input
+                type="checkbox"
+                class="accent-primary"
+                aria-label="Enable Max Tokens"
+                bind:checked={$parameterEnabledStore.maxTokens}
+                disabled={isStreaming}
+              />
+            </div>
+            <Input id="max-tokens" type="number" min="1" bind:value={$maxTokensStore} disabled={isStreaming || !$parameterEnabledStore.maxTokens} />
+            <p class="text-muted-foreground mt-1 text-xs">Defaults to 4096 for /v1/messages when disabled.</p>
           </div>
+        </TabsContent>
+
+        <TabsContent value="history">
+          <HistorySettings {history} disabled={isStreaming} onCleared={conversation.detach} />
         </TabsContent>
       </Tabs>
 
@@ -578,7 +657,9 @@
       onscroll={handleMessagesScroll}
     >
       {#if messages.length === 0}
-        <EmptyState full message="Start a conversation by typing a message below." />
+        {#if !conversation.loading}
+          <EmptyState full message="Start a conversation by typing a message below." />
+        {/if}
       {:else}
         <div class="mx-auto w-full max-w-3xl py-2">
         {#each messages as message, idx (idx)}
@@ -593,7 +674,7 @@
             statsLive={statsLiveFor(idx)}
             onEdit={message.role === "user" ? (newContent) => editMessage(idx, newContent) : undefined}
             interrupted={message.interrupted}
-            onRegenerate={!isStreaming && message.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
+            onRegenerate={!isStreaming && !conversation.loading && message.role === "assistant" && idx > 0 && messages[idx - 1].role === "user"
               ? () => regenerateFromIndex(idx - 1)
               : undefined}
           />
@@ -619,7 +700,8 @@
         bind:value={userInput}
         placeholder="Type a message..."
         onkeydown={handleKeyDown}
-        disabled={isStreaming || !$selectedModelStore}
+        onpaste={handleImagePaste}
+        disabled={isStreaming || conversation.loading || !$selectedModelStore}
         streaming={isStreaming}
         canSend={Boolean(userInput.trim()) || attachedImages.length > 0}
         onsend={sendMessage}
@@ -660,8 +742,8 @@
             size="icon-lg"
             class="text-muted-foreground shrink-0 rounded-full"
             onclick={() => fileInput?.click()}
-            disabled={isStreaming || !$selectedModelStore}
-            title="Attach image"
+            disabled={isStreaming || conversation.loading || !$selectedModelStore}
+            title="Attach image or paste it into the message box"
             aria-label="Attach image"
           >
             <Paperclip />

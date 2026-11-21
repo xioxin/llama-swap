@@ -71,6 +71,11 @@ type Scheduler interface {
 	// must run on the router's run-loop goroutine like every other Scheduler
 	// method (the baseRouter forwards it there).
 	QueuedSnapshot() QueueSnapshot
+	// Evictions reports, for each target, what starting it would cost right
+	// now, using the same running set a request would be planned against. It
+	// is read-only: it never queues, starts or stops anything. Unknown targets
+	// are omitted from the result.
+	Evictions(targets []string) map[string]Eviction
 }
 
 // QueuedRequest is one waiting request in the queue snapshot.
@@ -87,6 +92,18 @@ type QueuedRequest struct {
 type QueueSnapshot struct {
 	Queued    []QueuedRequest `json:"queued"`
 	NextModel string          `json:"next_model"` // model the head would swap in, "" when idle
+}
+
+// Eviction describes what serving a target would cost at the moment it was
+// computed. Models is nil when the target can serve without stopping anything,
+// including when it is already running. Cost is the sum of evict_cost for
+// Models, so it can be zero even when Models is not empty. State is the
+// target's process state, reported as StateStarting while a swap to it is in
+// flight but not yet visible in process state.
+type Eviction struct {
+	Models []string
+	Cost   int64
+	State  process.ProcessState
 }
 
 // Effects is implemented by the baseRouter. The scheduler calls back through it

@@ -11,6 +11,10 @@ import (
 	"github.com/mostlygeek/llama-swap/internal/swaputil"
 )
 
+// Eviction describes what starting a model would stop right now. It is an
+// alias for scheduler.Eviction so callers need not import the scheduler.
+type Eviction = scheduler.Eviction
+
 var (
 	ErrNoRouterFound     = swaputil.ErrNoRouterFound
 	ErrNoPeerModelFound  = swaputil.ErrNoPeerModelFound
@@ -74,6 +78,13 @@ type LocalRouter interface {
 	// QueuedSnapshot returns an ordered, read-only view of the scheduler's
 	// request queue and the model the head would swap in next.
 	QueuedSnapshot() scheduler.QueueSnapshot
+
+	// Evictions reports, for each target, the models that would be stopped
+	// to start it, their total evict_cost, and the target's state, using the
+	// scheduler's live view including swaps it has committed to. Targets this
+	// router does not handle are omitted. It never starts or stops anything.
+	// ctx bounds the wait for the router's run loop.
+	Evictions(ctx context.Context, targets ...string) (map[string]Eviction, error)
 
 	// SetStartGate installs a check that runs before the router starts any
 	// process. While it returns an error no model starts, and the requests
