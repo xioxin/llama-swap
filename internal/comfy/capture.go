@@ -68,9 +68,15 @@ type Output struct {
 }
 
 // historyRecord mirrors one entry of ComfyUI's GET /history/{id} value.
+//
+// Outputs is decoded per item because ComfyUI puts primitive node results in
+// the same map as produced files: a graph's INT/string/math nodes record
+// {"value": [n]} or {"text": ["..."]} entries alongside {"images": [...]}. The
+// item shape depends on the node, so decoding the whole map strictly into file
+// structs rejects otherwise valid records.
 type historyRecord struct {
-	Prompt  []json.RawMessage                  `json:"prompt"`
-	Outputs map[string]map[string][]outputFile `json:"outputs"`
+	Prompt  []json.RawMessage                       `json:"prompt"`
+	Outputs map[string]map[string][]json.RawMessage `json:"outputs"`
 	Status  struct {
 		StatusStr string              `json:"status_str"`
 		Completed bool                `json:"completed"`
@@ -122,14 +128,7 @@ func ParseHistory(body []byte) (*Capture, error) {
 		cap.WorkflowAPI = rec.Prompt[2]
 	}
 	if len(rec.Prompt) >= 4 {
-		var extra struct {
-			ExtraPNGInfo struct {
-				Workflow json.RawMessage `json:"workflow"`
-			} `json:"extra_pnginfo"`
-		}
-		if err := json.Unmarshal(rec.Prompt[3], &extra); err == nil {
-			cap.WorkflowUI = extra.ExtraPNGInfo.Workflow
-		}
+		cap.WorkflowUI = workflowFromExtraData(rec.Prompt[3])
 	}
 
 	cap.Status.StatusStr = rec.Status.StatusStr
@@ -152,6 +151,25 @@ func ParseHistory(body []byte) (*Capture, error) {
 		return nil, fmt.Errorf("comfy: history record %q has no workflow or outputs", promptID)
 	}
 	return cap, nil
+}
+
+// CaptureFromLive builds a pre-completion Capture from the workflow data
+// ComfyUI exposes for a prompt that is still queued or running. Outputs stay
+// empty until the workflow finishes; status is the queue state the tracker
+// observed. The returned Capture is replaced in place as the task progresses
+// and when its history snapshot becomes available.
+func CaptureFromLive(promptID string, live *LivePrompt, status JobStatus) *Capture {
+	if live == nil || len(live.Prompt) == 0 {
+		return nil
+	}
+	return &Capture{
+		PromptID:    promptID,
+		WorkflowAPI: live.Prompt,
+		WorkflowUI:  workflowFromExtraData(live.ExtraData),
+		Status:      CaptureStatus{StatusStr: string(status)},
+		Nodes:       parseNodesGraph(live.Prompt),
+		Outputs:     []Output{},
+	}
 }
 
 // parseMessages extracts cached-node count and the execution start/finish
@@ -206,23 +224,47 @@ var modelInputKeys = map[string]bool{
 	"control_net_name": true, "upscale_model": true, "style_model_name": true,
 }
 
+// workflowFromExtraData returns extra_data.extra_pnginfo.workflow: the editor
+// graph ComfyUI's frontend submits next to the executable prompt. API clients
+// such as comfy-cli often omit it, so it may be nil.
+func workflowFromExtraData(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var extra struct {
+		ExtraPNGInfo struct {
+			Workflow json.RawMessage `json:"workflow"`
+		} `json:"extra_pnginfo"`
+	}
+	if err := json.Unmarshal(raw, &extra); err != nil {
+		return nil
+	}
+	return extra.ExtraPNGInfo.Workflow
+}
+
 // parseNodes summarises the executable graph (prompt[2]) into node + model info.
 func parseNodes(prompt []json.RawMessage) []CaptureNode {
 	if len(prompt) < 3 {
 		return []CaptureNode{}
 	}
-	var graph map[string]struct {
+	return parseNodesGraph(prompt[2])
+}
+
+// parseNodesGraph summarises one executable graph into node + model info. The
+// graph is the same JSON in history's prompt[2] and in a live /queue item.
+func parseNodesGraph(graph json.RawMessage) []CaptureNode {
+	var nodesByID map[string]struct {
 		ClassType string `json:"class_type"`
 		Meta      struct {
 			Title string `json:"title"`
 		} `json:"_meta"`
 		Inputs map[string]json.RawMessage `json:"inputs"`
 	}
-	if err := json.Unmarshal(prompt[2], &graph); err != nil {
+	if len(graph) == 0 || json.Unmarshal(graph, &nodesByID) != nil {
 		return []CaptureNode{}
 	}
-	nodes := make([]CaptureNode, 0, len(graph))
-	for id, n := range graph {
+	nodes := make([]CaptureNode, 0, len(nodesByID))
+	for id, n := range nodesByID {
 		node := CaptureNode{NodeID: id, ClassType: n.ClassType, Title: n.Meta.Title}
 		for key, val := range n.Inputs {
 			if !modelInputKeys[key] {
@@ -257,11 +299,17 @@ func nodeLess(a, b CaptureNode) bool {
 }
 
 // parseOutputs flattens every produced file across nodes into Output entries.
-func parseOutputs(outputs map[string]map[string][]outputFile) []Output {
+// ComfyUI records primitive node results in the same map as files, so entries
+// that do not decode to a file (or have no filename) are skipped.
+func parseOutputs(outputs map[string]map[string][]json.RawMessage) []Output {
 	list := make([]Output, 0)
 	for nodeID, byKey := range outputs {
 		for _, files := range byKey {
-			for _, f := range files {
+			for _, raw := range files {
+				var f outputFile
+				if err := json.Unmarshal(raw, &f); err != nil || f.Filename == "" {
+					continue
+				}
 				kind := f.Metadata.Kind
 				if kind == "" {
 					kind = kindFromFilename(f.Filename)

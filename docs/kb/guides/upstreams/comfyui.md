@@ -4,7 +4,7 @@ summary: Name a model comfyui_auto and use /comfyui/ so ComfyUI's websocket does
 category: guides
 tags: [comfyui, image, websocket, upstream, swapping, ttl, docker]
 config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, comfyui.queueTimeout, comfyui.startEvicts, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
-updated: 2026-10-12
+updated: 2026-11-21
 ---
 
 # ComfyUI with the /comfyui endpoint
@@ -167,6 +167,12 @@ prompts plus recent finished ones, each with its state (`queued`, `running`,
 `completed`, `failed`, `cancelled`) and duration. The list merges live prompts
 from ComfyUI's queue with terminal states recorded by the task tracker.
 
+A finished workflow's duration is ComfyUI's own execution window: the time
+between its `execution_start` and `execution_success` (or error/interrupt)
+history messages. Time spent waiting in ComfyUI's queue and the tracking poll
+interval are not counted. When history has no timing messages the duration falls
+back to the elapsed time from submission.
+
 Each submitted workflow also appears as a row in the main Activity table (`model`
 `comfyui_auto`, path `/prompt`); its Status column shows the workflow's terminal
 state and the row is updated in place when it finishes. A workflow not observed
@@ -174,7 +180,7 @@ within the tracking window is marked `unknown`.
 
 ## Capture view
 
-Each finished workflow's Capture button opens a ComfyUI capture with three tabs:
+Each workflow's Capture button opens a ComfyUI capture with three tabs:
 
 - **Outputs** — every produced file. Images and videos preview inline (via
   llama-swap's `/api/comfy/view` proxy to ComfyUI); other types (audio, text,
@@ -182,14 +188,29 @@ Each finished workflow's Capture button opens a ComfyUI capture with three tabs:
   known, resolution, frame rate, duration and frame count.
 - **Workflow** — the workflow JSON in two forms: the **UI graph** (reopenable in
   ComfyUI's editor) and the **API graph** (the executable node list). Both can be
-  viewed and downloaded.
+  viewed and downloaded. The API client formats (`comfy-cli`, `comfy-mcp`) do
+  not submit a UI graph, so only the API graph is offered for those.
 - **Details** — execution status and duration, cached-node count, the node list
   (class type + title), and the model files used (UNET / VAE / CLIP / LoRA names).
 
-The workflow JSON and metadata are snapshotted into llama-swap when the task
-finishes, so the capture stays viewable even after ComfyUI restarts or clears its
-history. Output media is **not** copied: it stays on ComfyUI and is streamed live
-through `/api/comfy/view`.
+A capture is written as soon as the task tracker observes the workflow in
+ComfyUI's queue, before it starts running. That first snapshot contains the
+workflow graphs and node list but no outputs. The tracker updates the same
+capture in place — queued to running, then the finished status, output files,
+timing and cached-node count — so one task keeps exactly one stored capture and
+updates never make the capture store grow. Queued, running, failed, cancelled
+and completed tasks all have a viewable capture; in-progress workflows simply
+show an empty Outputs tab.
+
+Because the capture lives in llama-swap rather than ComfyUI, its workflow and
+nodes stay viewable after ComfyUI restarts or clears its history. Output media is
+**not** copied: it stays on ComfyUI and is streamed live through
+`/api/comfy/view`. Each task's capture counts against `captureBuffer`; raise it
+when running large batches, and set `store.path` with `store.persistCaptures` to
+keep captures across llama-swap restarts. A capture that is pruned, or a task
+submitted while captures are disabled, has no View button. Opening a capture
+does not auto-refresh; reopen the dialog to see a newer version of an
+in-progress task.
 
 When ComfyUI is already running, previews load immediately. When it is not, each
 preview shows a placeholder with a **Load preview** button: opening the dialog

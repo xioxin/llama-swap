@@ -2,9 +2,11 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,22 +21,33 @@ import (
 // fakeComfyUpstream is a minimal ComfyUI stand-in whose job state can be set
 // per test to drive terminal-status backfill.
 type fakeComfyUpstream struct {
-	srv       *httptest.Server
-	status    comfy.JobStatus
-	liveQueue string
+	srv    *httptest.Server
+	status comfy.JobStatus
 	// vanish models a task cancelled while queued: it is in the queue at first,
 	// then disappears from both the queue and history.
 	vanish atomic.Bool
 	// holdsID is the prompt id the queue reports while not vanished.
 	holdsID string
+	// startTS and finishTS, when positive, are emitted as the execution_start
+	// and terminal message timestamps.
+	startTS  int64
+	finishTS int64
+	// outputsJSON overrides the history record's outputs object.
+	outputsJSON string
+
+	// liveQueue, when non-empty, is a raw /queue body. Tests use it to place
+	// the prompt in the running/pending queue with a workflow payload. It is
+	// guarded because the tracker polls while a test swaps it.
+	queueMu   sync.Mutex
+	liveQueue string
 }
 
 func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 	f := &fakeComfyUpstream{status: status}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
-		if f.liveQueue != "" {
-			_, _ = w.Write([]byte(f.liveQueue))
+		if q := f.queueBody(); q != "" {
+			_, _ = w.Write([]byte(q))
 			return
 		}
 		if f.holdsID != "" && !f.vanish.Load() {
@@ -51,21 +64,59 @@ func newFakeComfyUpstream(status comfy.JobStatus) *fakeComfyUpstream {
 			_, _ = w.Write([]byte(`{}`))
 			return
 		}
-		msg := `[]`
-		switch f.status {
-		case comfy.StatusFailed:
-			msg = `[["execution_error",{}]]`
-		case comfy.StatusCancelled:
-			msg = `[["execution_interrupted",{}]]`
-		}
-		_, _ = w.Write([]byte(`{"` + id + `":{"status":{"completed":true,"status_str":"success","messages":` + msg + `},` +
-			`"outputs":{"47":{"images":[{"filename":"a.png","subfolder":"","type":"output"}]}}}}`))
+		// The prompt graph is included so a history capture is meaningful even
+		// when the workflow produced no output files.
+		_, _ = w.Write([]byte(`{"` + id + `":{` +
+			`"prompt":[0,"` + id + `",{"47":{"inputs":{},"class_type":"SaveImage","_meta":{"title":"Save"}}},{"extra_pnginfo":{"workflow":{"nodes":[]}}},[]],` +
+			`"status":{"completed":true,"status_str":"success","messages":` + f.messages() + `},` +
+			`"outputs":` + f.outputs() + `}}`))
 	})
 	f.srv = httptest.NewServer(mux)
 	return f
 }
 
 func (f *fakeComfyUpstream) close() { f.srv.Close() }
+
+func (f *fakeComfyUpstream) setLiveQueue(body string) {
+	f.queueMu.Lock()
+	f.liveQueue = body
+	f.queueMu.Unlock()
+}
+
+func (f *fakeComfyUpstream) queueBody() string {
+	f.queueMu.Lock()
+	defer f.queueMu.Unlock()
+	return f.liveQueue
+}
+
+// outputs defaults to one image plus a primitive node result, mirroring real
+// ComfyUI history records.
+func (f *fakeComfyUpstream) outputs() string {
+	if f.outputsJSON != "" {
+		return f.outputsJSON
+	}
+	return `{"47":{"images":[{"filename":"a.png","subfolder":"","type":"output"}]},"9":{"value":[1]}}`
+}
+
+func (f *fakeComfyUpstream) messages() string {
+	parts := []string{}
+	if f.startTS > 0 {
+		parts = append(parts, fmt.Sprintf(`["execution_start",{"timestamp":%d}]`, f.startTS))
+	}
+	terminal := "execution_success"
+	switch f.status {
+	case comfy.StatusFailed:
+		terminal = "execution_error"
+	case comfy.StatusCancelled:
+		terminal = "execution_interrupted"
+	}
+	if f.finishTS > 0 {
+		parts = append(parts, fmt.Sprintf(`[%q,{"timestamp":%d}]`, terminal, f.finishTS))
+	} else if f.status != comfy.StatusCompleted {
+		parts = append(parts, fmt.Sprintf(`[%q,{}]`, terminal))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
 
 func TestComfy_ExtractPromptID(t *testing.T) {
 	cases := map[string]string{
@@ -518,5 +569,241 @@ func TestComfyTask_TrackStoresCapture(t *testing.T) {
 	}
 	if kind != CaptureKindComfy || snap == nil || snap.PromptID != "abc" {
 		t.Fatalf("readCapture(%q) = kind %q snap %+v, want comfy for abc", captureID, kind, snap)
+	}
+}
+
+// waitForCondition polls cond until it is true or the timeout elapses.
+func waitForCondition(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// capturesEnabledTestServer is newTestServerWithConfig with the capture store
+// enabled (newTestServerWithConfig builds its monitor with captureBuffer 0).
+func capturesEnabledTestServer(t *testing.T, cfg config.Config) *Server {
+	t.Helper()
+	s := newTestServerWithConfig(cfg, nil, nil)
+	s.metrics = newMetricsMonitor(s.logs.ProxyLogs, 0, 5, s.store)
+	t.Cleanup(func() {
+		s.metrics.Close()
+		s.store.Close()
+	})
+	return s
+}
+
+// TestComfyTask_LiveCaptureTracksState proves a capture is written as soon as
+// the prompt is visible in ComfyUI's queue, then updated in place as it moves
+// queued -> running -> completed. Outputs appear only in the final version and
+// the capture ID never changes, so updates do not accumulate captures.
+func TestComfyTask_LiveCaptureTracksState(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+
+	s := capturesEnabledTestServer(t, config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	})
+	prevInterval := comfyPollInterval
+	comfyPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { comfyPollInterval = prevInterval })
+
+	graph := `{"47":{"inputs":{},"class_type":"SaveImage","_meta":{"title":"Save"}}}`
+	extra := `{"extra_pnginfo":{"workflow":{"nodes":[]}}}`
+	fc.setLiveQueue(`{"queue_running":[],"queue_pending":[[1,"live1",` + graph + `,` + extra + `,[]]]}`)
+
+	newComfyTaskTracker(s).track(store.ActivityLogEntry{
+		Timestamp: time.Now(),
+		Model:     config.ComfyUIModelID,
+		ReqPath:   comfyPromptPath,
+	}, "live1")
+
+	var captureID string
+	waitForCondition(t, 3*time.Second, "queued capture", func() bool {
+		entries := listActivity(t, s)
+		if len(entries) != 1 || entries[0].CaptureID == "" {
+			return false
+		}
+		captureID = entries[0].CaptureID
+		_, snap, _, found := s.metrics.readCapture(captureID)
+		return found && snap != nil &&
+			snap.Status.StatusStr == string(comfy.StatusQueued) &&
+			len(snap.WorkflowAPI) > 0 && len(snap.Outputs) == 0
+	})
+
+	fc.setLiveQueue(`{"queue_running":[[1,"live1",` + graph + `,` + extra + `,[]]],"queue_pending":[]}`)
+	waitForCondition(t, 3*time.Second, "running capture update", func() bool {
+		_, snap, _, found := s.metrics.readCapture(captureID)
+		return found && snap != nil &&
+			snap.Status.StatusStr == string(comfy.StatusRunning) &&
+			len(snap.WorkflowAPI) > 0 && len(snap.Outputs) == 0
+	})
+
+	fc.setLiveQueue("")
+	waitForCondition(t, 3*time.Second, "completed capture", func() bool {
+		entries := listActivity(t, s)
+		if len(entries) != 1 || entries[0].Metadata[metaComfyStatus] != string(comfy.StatusCompleted) {
+			return false
+		}
+		_, snap, _, found := s.metrics.readCapture(captureID)
+		return found && snap != nil && snap.Status.Completed && len(snap.Outputs) == 1
+	})
+
+	entries := listActivity(t, s)
+	if entries[0].CaptureID != captureID {
+		t.Errorf("capture ID changed from %q to %q; updates must replace the same capture", captureID, entries[0].CaptureID)
+	}
+}
+
+// TestComfyTask_CancelledBeforeStartKeepsCapture proves a workflow cancelled
+// while queued keeps its pre-completion capture, finalized as cancelled.
+func TestComfyTask_CancelledBeforeStartKeepsCapture(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+
+	s := capturesEnabledTestServer(t, config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	})
+	prevInterval := comfyPollInterval
+	comfyPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { comfyPollInterval = prevInterval })
+
+	graph := `{"47":{"inputs":{},"class_type":"SaveImage","_meta":{"title":"Save"}}}`
+	fc.setLiveQueue(`{"queue_running":[],"queue_pending":[[1,"gone1",` + graph + `,{},[]]]}`)
+
+	newComfyTaskTracker(s).track(store.ActivityLogEntry{
+		Timestamp: time.Now(),
+		Model:     config.ComfyUIModelID,
+		ReqPath:   comfyPromptPath,
+	}, "gone1")
+
+	var captureID string
+	waitForCondition(t, 3*time.Second, "queued capture", func() bool {
+		entries := listActivity(t, s)
+		if len(entries) != 1 || entries[0].CaptureID == "" {
+			return false
+		}
+		captureID = entries[0].CaptureID
+		_, snap, _, found := s.metrics.readCapture(captureID)
+		return found && snap != nil && snap.Status.StatusStr == string(comfy.StatusQueued)
+	})
+
+	// The prompt disappears from the queue and never reaches history.
+	fc.setLiveQueue("")
+	fc.vanish.Store(true)
+	waitForCondition(t, 3*time.Second, "cancelled row", func() bool {
+		entries := listActivity(t, s)
+		return len(entries) == 1 && entries[0].Metadata[metaComfyStatus] == string(comfy.StatusCancelled)
+	})
+
+	_, snap, _, found := s.metrics.readCapture(captureID)
+	if !found || snap == nil {
+		t.Fatalf("capture %q was lost when the task was cancelled", captureID)
+	}
+	if snap.Status.StatusStr != string(comfy.StatusCancelled) {
+		t.Errorf("capture status = %q, want cancelled", snap.Status.StatusStr)
+	}
+	if len(snap.WorkflowAPI) == 0 {
+		t.Error("capture workflow lost, want the pre-completion graph kept")
+	}
+}
+
+// TestComfyTask_CompletedWithoutOutputsStoresCapture proves a finished workflow
+// with no produced files still has a capture (workflow + nodes, empty outputs).
+func TestComfyTask_CompletedWithoutOutputsStoresCapture(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+	fc.outputsJSON = `{}`
+
+	s := capturesEnabledTestServer(t, config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	})
+
+	newComfyTaskTracker(s).track(store.ActivityLogEntry{
+		Timestamp: time.Now(),
+		Model:     config.ComfyUIModelID,
+		ReqPath:   comfyPromptPath,
+	}, "empty1")
+
+	var captureID string
+	waitForCondition(t, 3*time.Second, "completed capture without outputs", func() bool {
+		entries := listActivity(t, s)
+		if len(entries) != 1 || entries[0].CaptureID == "" ||
+			entries[0].Metadata[metaComfyStatus] != string(comfy.StatusCompleted) {
+			return false
+		}
+		captureID = entries[0].CaptureID
+		_, snap, _, found := s.metrics.readCapture(captureID)
+		return found && snap != nil && len(snap.WorkflowAPI) > 0 && snap.Outputs != nil && len(snap.Outputs) == 0
+	})
+}
+
+// TestComfyTask_DurationUsesExecutionWindow proves the activity duration is
+// ComfyUI's execution window, not submit-to-terminal elapsed time (which would
+// include queue wait).
+func TestComfyTask_DurationUsesExecutionWindow(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+	fc.startTS = 1000
+	fc.finishTS = 11000
+
+	s := newTestServerWithConfig(config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	}, nil, nil)
+	defer s.store.Close()
+
+	newComfyTaskTracker(s).track(store.ActivityLogEntry{
+		Timestamp: time.Now().Add(-time.Hour),
+		Model:     config.ComfyUIModelID,
+		ReqPath:   comfyPromptPath,
+	}, "timed1")
+
+	waitForCondition(t, 3*time.Second, "completed timed row", func() bool {
+		entries := listActivity(t, s)
+		return len(entries) == 1 && entries[0].Metadata[metaComfyStatus] == string(comfy.StatusCompleted)
+	})
+	if got := listActivity(t, s)[0].DurationMs; got != 10000 {
+		t.Errorf("DurationMs = %d, want 10000 (execution window)", got)
+	}
+}
+
+// TestComfyTask_DurationFallsBackToElapsed proves a history record without
+// timing messages keeps the elapsed-time fallback.
+func TestComfyTask_DurationFallsBackToElapsed(t *testing.T) {
+	fc := newFakeComfyUpstream(comfy.StatusCompleted)
+	defer fc.close()
+
+	s := newTestServerWithConfig(config.Config{
+		Models: map[string]config.ModelConfig{
+			config.ComfyUIModelID: {Proxy: fc.srv.URL},
+		},
+	}, nil, nil)
+	defer s.store.Close()
+
+	newComfyTaskTracker(s).track(store.ActivityLogEntry{
+		Timestamp: time.Now().Add(-2 * time.Second),
+		Model:     config.ComfyUIModelID,
+		ReqPath:   comfyPromptPath,
+	}, "notime1")
+
+	waitForCondition(t, 3*time.Second, "completed row without timing", func() bool {
+		entries := listActivity(t, s)
+		return len(entries) == 1 && entries[0].Metadata[metaComfyStatus] == string(comfy.StatusCompleted)
+	})
+	if got := listActivity(t, s)[0].DurationMs; got < 1900 {
+		t.Errorf("DurationMs = %d, want the elapsed fallback (~2000)", got)
 	}
 }

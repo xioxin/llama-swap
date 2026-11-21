@@ -207,3 +207,168 @@ func TestComfy_ParseHistory_NonNilArrays(t *testing.T) {
 		t.Errorf("serialized null arrays: %s", b)
 	}
 }
+
+// historyFixturePrimitiveOutputs mirrors a real ComfyUI history record whose
+// graph includes primitive nodes. Their results ("value": [8]) live in the same
+// outputs map as media files; the strict file-only decode used to reject the
+// whole record, so a finished workflow ended up with no capture.
+const historyFixturePrimitiveOutputs = `{
+  "1f0e50b5-69ff-497b-86a3-3c3dc7202cca": {
+    "prompt": [
+      0,
+      "1f0e50b5-69ff-497b-86a3-3c3dc7202cca",
+      {
+        "5693": {"inputs": {"expression": "a+b"}, "class_type": "MathExpression|pysssss", "_meta": {"title": "Math Expression"}},
+        "5814": {"inputs": {"filename_prefix": "beach/x", "images": ["5741_5740", 0]}, "class_type": "VideoCombineV2", "_meta": {"title": "Video Combine"}}
+      },
+      {"comfy_usage_source": "comfy-cli/comfy-mcp", "client_id": "cid", "create_time": 1795179856733},
+      ["5693", "5814"]
+    ],
+    "outputs": {
+      "5693": {"value": [8]},
+      "5741_5725": {"value": [1472]},
+      "5741_5726": {"value": [1088]},
+      "5814": {"gifs": [{
+        "filename": "01 girl - Part 1 _v5_00001-audio.mp4",
+        "subfolder": "beach",
+        "type": "output",
+        "format": "video/h264-mp4",
+        "fullpath": "/home/user/comfy/ComfyUI/output/beach/01 girl - Part 1 _v5_00001-audio.mp4",
+        "metadata": {"kind": "video", "width": 1472, "height": 1088, "duration": 8.0, "fps": 24.0, "frame_count": 192}
+      }]}
+    },
+    "status": {
+      "status_str": "success",
+      "completed": true,
+      "messages": [
+        ["execution_start", {"prompt_id": "1f0e50b5-69ff-497b-86a3-3c3dc7202cca", "timestamp": 1795179856734}],
+        ["execution_cached", {"nodes": [], "prompt_id": "1f0e50b5-69ff-497b-86a3-3c3dc7202cca", "timestamp": 1795179856758}],
+        ["execution_success", {"prompt_id": "1f0e50b5-69ff-497b-86a3-3c3dc7202cca", "timestamp": 1795180133221}]
+      ]
+    },
+    "meta": {"5693": {"node_id": "5693"}}
+  }
+}`
+
+// TestComfy_ParseHistory_PrimitiveOutputs is the regression guard for captures
+// that went missing because a primitive node's "value" output made the whole
+// history record fail to decode.
+func TestComfy_ParseHistory_PrimitiveOutputs(t *testing.T) {
+	cap, err := ParseHistory([]byte(historyFixturePrimitiveOutputs))
+	if err != nil {
+		t.Fatalf("ParseHistory: %v", err)
+	}
+	if cap.PromptID != "1f0e50b5-69ff-497b-86a3-3c3dc7202cca" {
+		t.Errorf("PromptID = %q", cap.PromptID)
+	}
+	if len(cap.Nodes) != 2 {
+		t.Errorf("nodes = %d, want 2", len(cap.Nodes))
+	}
+	if len(cap.Outputs) != 1 {
+		t.Fatalf("outputs = %+v, want 1 file (primitive values are not files)", cap.Outputs)
+	}
+	o := cap.Outputs[0]
+	if o.Filename != "01 girl - Part 1 _v5_00001-audio.mp4" || o.Kind != "video" || o.FrameCount != 192 || o.Width != 1472 {
+		t.Errorf("output = %+v", o)
+	}
+	if cap.Status.DurationMs != 276487 {
+		t.Errorf("DurationMs = %d, want 276487", cap.Status.DurationMs)
+	}
+	if len(cap.WorkflowAPI) == 0 {
+		t.Error("WorkflowAPI empty, want the submitted graph")
+	}
+	if len(cap.WorkflowUI) != 0 {
+		t.Errorf("WorkflowUI = %d bytes, want none for an API-client submission", len(cap.WorkflowUI))
+	}
+}
+
+// TestComfy_ParseHistory_NoFileOutputs proves a completed workflow that produced
+// no files still gets a capture: the workflow graph is enough to make it useful.
+func TestComfy_ParseHistory_NoFileOutputs(t *testing.T) {
+	fixture := `{
+	  "x": {
+	    "prompt": [0, "x", {"1": {"inputs": {}, "class_type": "KSampler", "_meta": {"title": "KSampler"}}}, {"extra_pnginfo": {"workflow": {"nodes": []}}}, []],
+	    "outputs": {},
+	    "status": {"status_str": "success", "completed": true, "messages": [
+	      ["execution_start", {"timestamp": 100}],
+	      ["execution_success", {"timestamp": 350}]
+	    ]}
+	  }
+	}`
+	cap, err := ParseHistory([]byte(fixture))
+	if err != nil {
+		t.Fatalf("ParseHistory: %v", err)
+	}
+	if cap.Outputs == nil || len(cap.Outputs) != 0 {
+		t.Errorf("outputs = %#v, want a non-nil empty slice", cap.Outputs)
+	}
+	if len(cap.WorkflowAPI) == 0 || len(cap.WorkflowUI) == 0 {
+		t.Errorf("workflows not captured: api=%d ui=%d", len(cap.WorkflowAPI), len(cap.WorkflowUI))
+	}
+	if cap.Status.DurationMs != 250 {
+		t.Errorf("DurationMs = %d, want 250", cap.Status.DurationMs)
+	}
+}
+
+// TestComfy_ParseHistory_SkipsNonFileItems proves text/primitive/malformed
+// output items are ignored individually instead of failing the record.
+func TestComfy_ParseHistory_SkipsNonFileItems(t *testing.T) {
+	fixture := `{
+	  "x": {
+	    "prompt": [0, "x", {}, {}, []],
+	    "outputs": {
+	      "1": {"text": ["hello"]},
+	      "2": {"value": [1, 2]},
+	      "3": {"files": ["not-a-file", null, {"filename": "a.png", "subfolder": "", "type": "output"}]},
+	      "4": {"images": [{"filename": "b.png", "type": "output", "metadata": {"kind": "image"}}]}
+	    },
+	    "status": {"status_str": "success", "completed": true, "messages": []}
+	  }
+	}`
+	cap, err := ParseHistory([]byte(fixture))
+	if err != nil {
+		t.Fatalf("ParseHistory: %v", err)
+	}
+	if len(cap.Outputs) != 2 {
+		t.Fatalf("outputs = %+v, want a.png and b.png", cap.Outputs)
+	}
+	names := []string{cap.Outputs[0].Filename, cap.Outputs[1].Filename}
+	if names[0] != "a.png" || names[1] != "b.png" {
+		t.Errorf("filenames = %v", names)
+	}
+}
+
+// TestComfy_CaptureFromLive proves an in-progress queue item becomes a capture
+// with its workflow, nodes and an empty output list.
+func TestComfy_CaptureFromLive(t *testing.T) {
+	live := &LivePrompt{
+		Prompt:    json.RawMessage(`{"44":{"inputs":{"unet_name":"Anima/nova.safetensors"},"class_type":"UNETLoader","_meta":{"title":"Load Diffusion Model"}}}`),
+		ExtraData: json.RawMessage(`{"extra_pnginfo":{"workflow":{"nodes":[{"id":44}]}}}`),
+	}
+	cap := CaptureFromLive("p1", live, StatusQueued)
+	if cap == nil {
+		t.Fatal("CaptureFromLive = nil")
+	}
+	if cap.PromptID != "p1" {
+		t.Errorf("PromptID = %q", cap.PromptID)
+	}
+	if cap.Status.StatusStr != "queued" || cap.Status.Completed {
+		t.Errorf("status = %+v, want queued/incomplete", cap.Status)
+	}
+	if cap.Outputs == nil || len(cap.Outputs) != 0 {
+		t.Errorf("outputs = %#v, want a non-nil empty slice", cap.Outputs)
+	}
+	if len(cap.Nodes) != 1 || len(cap.Nodes[0].Models) != 1 || cap.Nodes[0].Models[0] != "Anima/nova.safetensors" {
+		t.Errorf("nodes = %+v", cap.Nodes)
+	}
+	if len(cap.WorkflowAPI) == 0 || len(cap.WorkflowUI) == 0 {
+		t.Errorf("workflows not captured: api=%d ui=%d", len(cap.WorkflowAPI), len(cap.WorkflowUI))
+	}
+
+	if got := CaptureFromLive("p1", nil, StatusQueued); got != nil {
+		t.Errorf("CaptureFromLive(nil) = %+v, want nil", got)
+	}
+	if got := CaptureFromLive("p1", &LivePrompt{}, StatusQueued); got != nil {
+		t.Errorf("CaptureFromLive(empty) = %+v, want nil", got)
+	}
+}

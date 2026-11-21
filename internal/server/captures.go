@@ -247,10 +247,13 @@ type storedComfyCapture struct {
 	Capture *comfy.Capture `json:"capture"`
 }
 
-// addComfyCapture stores a ComfyUI capture snapshot under captureID, the
-// capture ID recorded on its activity row. Only the small JSON/metadata
-// snapshot is stored; output media stays on ComfyUI and is proxied live.
-// Returns true when stored.
+// addComfyCapture writes or replaces a ComfyUI capture snapshot under
+// captureID, the capture ID recorded on its activity row. The tracker writes
+// one when it first observes the task and replaces that same entry as status,
+// outputs and timing change, so a task keeps exactly one stored capture and
+// updates never grow the capture store. Only the small JSON/metadata snapshot
+// is stored; output media stays on ComfyUI and is proxied live. Returns true
+// when stored.
 func (mp *metricsMonitor) addComfyCapture(captureID string, capture *comfy.Capture) bool {
 	if !mp.enableCaptures || capture == nil {
 		return false
@@ -279,7 +282,7 @@ func (mp *metricsMonitor) addComfyCapture(captureID string, capture *comfy.Captu
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := mp.store.Captures().Put(ctx, store.CaptureEntry{
+	if err := mp.store.Captures().Replace(ctx, store.CaptureEntry{
 		ID:                captureID,
 		Data:              compressed,
 		UncompressedBytes: int64(len(tagged)),

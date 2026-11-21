@@ -95,10 +95,12 @@ func extractComfyPromptID(body []byte) string {
 }
 
 // comfyTaskTracker records ComfyUI workflow submissions in the activity log and
-// backfills each row with the workflow's terminal status. Tracking is
-// asynchronous: submitting a workflow returns immediately and the row is
-// updated when the prompt reaches a terminal state (or the poll deadline
-// passes, in which case it is marked unknown).
+// keeps each workflow's capture snapshot current. Tracking is asynchronous:
+// submitting a workflow returns immediately; once ComfyUI reports the prompt,
+// the tracker writes a pre-completion capture (workflow and nodes, no outputs)
+// and replaces it as the queue state changes. The row and capture are finalized
+// when the prompt reaches a terminal state (or the poll deadline passes, in
+// which case the row is marked unknown).
 type comfyTaskTracker struct {
 	server *Server
 }
@@ -124,9 +126,8 @@ func (t *comfyTaskTracker) track(row store.ActivityLogEntry, promptID string) {
 	// Terminal status is unknown until the workflow finishes.
 	row.Metadata[metaComfyStatus] = string(comfy.StatusRunning)
 
-	// Reserve the capture ID now so the activity listing can report
-	// has_capture once finalize writes the snapshot. Empty when captures are
-	// disabled.
+	// Reserve the capture ID now so the first observation can write a
+	// pre-completion capture under it. Empty when captures are disabled.
 	row.CaptureID = t.server.metrics.newCaptureID(row.Timestamp)
 
 	stored, ok := t.server.metrics.queueMetrics(row)
@@ -142,6 +143,10 @@ func (t *comfyTaskTracker) track(row store.ActivityLogEntry, promptID string) {
 // updates the activity row. It gives up after the configured tracking window
 // and records "unknown" so the row never stays stuck as running. The poll uses
 // a detached context: a cancelled client request must not abandon the row.
+//
+// While the prompt is queued or running, each observed state change writes a
+// pre-completion capture (same capture ID every time) so the Capture view is
+// usable before outputs exist and survives a ComfyUI restart.
 func (t *comfyTaskTracker) awaitTerminal(row store.ActivityLogEntry, promptID string) {
 	client := t.server.comfyClient()
 	if client == nil {
@@ -160,43 +165,62 @@ func (t *comfyTaskTracker) awaitTerminal(row store.ActivityLogEntry, promptID st
 	// registered is not falsely marked cancelled.
 	seenLive := false
 
+	// liveCap is the most recent pre-completion snapshot. It is finalized with
+	// the terminal status when ComfyUI has no history record to replace it.
+	var liveCap *comfy.Capture
+	liveStatus := comfy.JobStatus("")
+
 	for {
-		status, err := client.JobState(ctx, promptID)
+		status, live, err := client.PromptState(ctx, promptID)
 		if err == nil {
 			if status.IsTerminal() {
-				t.finalize(row, promptID, status)
+				t.finalize(row, promptID, status, liveCap)
 				return
 			}
-			if status == comfy.StatusQueued || status == comfy.StatusRunning {
+			if status.IsPending() {
 				seenLive = true
+				// Write the capture as soon as the workflow is visible and
+				// again only when the queue state changes (queued -> running).
+				// Replacing the same capture ID keeps one task to one stored
+				// snapshot, so updates never grow the capture store.
+				if live != nil && row.CaptureID != "" && status != liveStatus {
+					if cap := comfy.CaptureFromLive(promptID, live, status); cap != nil {
+						t.server.metrics.addComfyCapture(row.CaptureID, cap)
+						liveCap = cap
+						liveStatus = status
+					}
+				}
 			} else if seenLive {
 				// Was live, now neither queued nor in history: cancelled before
 				// start.
-				t.finalize(row, promptID, comfy.StatusCancelled)
+				t.finalize(row, promptID, comfy.StatusCancelled, liveCap)
 				return
 			}
 		}
 		if time.Now().After(deadline) {
-			t.finalize(row, promptID, comfy.StatusUnknown)
+			t.finalize(row, promptID, comfy.StatusUnknown, liveCap)
 			return
 		}
 		select {
 		case <-ctx.Done():
-			t.finalize(row, promptID, comfy.StatusUnknown)
+			t.finalize(row, promptID, comfy.StatusUnknown, liveCap)
 			return
-		case <-time.After(t.server.comfyPollInterval()):
+		case <-time.After(comfyPollInterval):
 		}
 	}
 }
 
-// finalize stamps the terminal status and elapsed duration on the activity row
-// and persists the update.
-func (t *comfyTaskTracker) finalize(row store.ActivityLogEntry, promptID string, status comfy.JobStatus) {
+// finalize stamps the terminal status and duration on the activity row, writes
+// the final capture, and persists the update. liveCap is the last
+// pre-completion snapshot, used when ComfyUI no longer has a history record.
+func (t *comfyTaskTracker) finalize(row store.ActivityLogEntry, promptID string, status comfy.JobStatus, liveCap *comfy.Capture) {
 	if row.Metadata == nil {
 		row.Metadata = map[string]string{}
 	}
 	row.Metadata[metaComfyPromptID] = promptID
 	row.Metadata[metaComfyStatus] = string(status)
+	// Fallback: submit-to-terminal elapsed time. Overridden below with
+	// ComfyUI's own execution window when the history record is available.
 	row.DurationMs = int(time.Since(row.Timestamp).Milliseconds())
 	if status == comfy.StatusUnknown && row.ErrorMsg == "" {
 		row.ErrorMsg = "comfyui workflow status not observed before timeout"
@@ -208,10 +232,30 @@ func (t *comfyTaskTracker) finalize(row store.ActivityLogEntry, promptID string,
 	// Snapshot the finished workflow (workflow graphs, outputs, timing, node
 	// and model list) into the capture store so the Capture view stays usable
 	// after ComfyUI restarts or clears its history. Output media is not stored;
-	// it is proxied from ComfyUI on demand.
-	if status.IsTerminal() && row.CaptureID != "" {
-		if snap := t.snapshot(ctx, promptID); snap != nil {
+	// it is proxied from ComfyUI on demand. Fetched even when captures are
+	// disabled so Duration still uses ComfyUI's execution window.
+	var snap *comfy.Capture
+	if status.IsTerminal() {
+		snap = t.snapshot(ctx, promptID)
+	}
+	// The history status messages carry execution_start and the terminal
+	// timestamp; their difference is the workflow's own run time. Prefer it so
+	// queue wait and the poll interval do not count. Independent of whether a
+	// capture is stored, since Duration is useful with captures disabled too.
+	if snap != nil && snap.Status.DurationMs > 0 {
+		row.DurationMs = int(snap.Status.DurationMs)
+	}
+
+	if row.CaptureID != "" {
+		switch {
+		case snap != nil:
 			t.server.metrics.addComfyCapture(row.CaptureID, snap)
+		case liveCap != nil:
+			// No history record (cancelled before it ran, or ComfyUI is gone):
+			// keep the workflow snapshot but record the terminal outcome.
+			liveCap.Status.StatusStr = string(status)
+			liveCap.Status.Completed = status == comfy.StatusCompleted
+			t.server.metrics.addComfyCapture(row.CaptureID, liveCap)
 		}
 	}
 
@@ -249,10 +293,9 @@ func (s *Server) comfyTrackWindow() time.Duration {
 	return 2 * time.Hour
 }
 
-// comfyPollInterval is the delay between terminal-state probes.
-func (s *Server) comfyPollInterval() time.Duration {
-	return 2 * time.Second
-}
+// comfyPollInterval is the delay between terminal-state probes. It is a
+// variable so tests can shorten it; production polls every two seconds.
+var comfyPollInterval = 2 * time.Second
 
 // comfyClient returns the router-independent ComfyUI client used for task
 // tracking, built from the comfyui_auto model's proxy. It is nil when the model

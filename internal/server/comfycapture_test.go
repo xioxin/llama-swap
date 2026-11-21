@@ -203,3 +203,41 @@ func TestServer_ComfyView_StartFailure(t *testing.T) {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
 }
+
+// TestServer_ComfyCaptureReplace proves updating a workflow capture reuses the
+// same capture ID and replaces the earlier snapshot instead of adding another.
+func TestServer_ComfyCaptureReplace(t *testing.T) {
+	mm := newTestMetricsMonitor(t, logmon.NewWriter(io.Discard), 100, 5)
+	id := store.NewCaptureID(time.Now())
+
+	live := &comfy.Capture{
+		PromptID:    "wf-1",
+		WorkflowAPI: json.RawMessage(`{"1":{"class_type":"KSampler"}}`),
+		Status:      comfy.CaptureStatus{StatusStr: "running"},
+		Outputs:     []comfy.Output{},
+	}
+	if !mm.addComfyCapture(id, live) {
+		t.Fatal("addComfyCapture(live) returned false")
+	}
+
+	final := &comfy.Capture{
+		PromptID:    "wf-1",
+		WorkflowAPI: json.RawMessage(`{"1":{"class_type":"KSampler"}}`),
+		Status:      comfy.CaptureStatus{StatusStr: "success", Completed: true, DurationMs: 2500},
+		Outputs:     []comfy.Output{{Filename: "a.png", Kind: "image", Type: "output"}},
+	}
+	if !mm.addComfyCapture(id, final) {
+		t.Fatal("addComfyCapture(final) returned false")
+	}
+
+	_, got, _, found := mm.readCapture(id)
+	if !found || got == nil {
+		t.Fatalf("capture %q not found after replace", id)
+	}
+	if got.Status.StatusStr != "success" || !got.Status.Completed || got.Status.DurationMs != 2500 {
+		t.Errorf("status = %+v, want the final snapshot", got.Status)
+	}
+	if len(got.Outputs) != 1 || got.Outputs[0].Filename != "a.png" {
+		t.Errorf("outputs = %+v, want the final file list", got.Outputs)
+	}
+}

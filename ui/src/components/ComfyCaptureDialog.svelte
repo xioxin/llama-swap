@@ -115,6 +115,25 @@
   let outputs = $derived(capture?.outputs ?? []);
   let nodeList = $derived(capture?.nodes ?? []);
   let comfyStatus = $derived(capture?.status ?? { status_str: "", completed: false, started_at_ms: 0, finished_at_ms: 0, duration_ms: 0, cached_nodes: 0 });
+
+  // A capture is written as soon as the workflow is queued and updated in
+  // place, so its status can be a live queue state rather than history's
+  // success/error. Colour it like the activity table's status badge.
+  let comfyBadge = $derived.by(() => {
+    const raw = comfyStatus.status_str;
+    if (comfyStatus.completed || raw === "success") {
+      return { label: raw || "completed", className: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400" };
+    }
+    if (raw === "queued" || raw === "running") {
+      return { label: raw, className: "bg-amber-500/15 text-amber-600 dark:text-amber-400" };
+    }
+    if (raw === "failed" || raw === "error") {
+      return { label: raw, className: "bg-red-500/15 text-red-600 dark:text-red-400" };
+    }
+    return { label: raw || "cancelled", className: "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400" };
+  });
+
+  let workflowIsLive = $derived(comfyStatus.status_str === "queued" || comfyStatus.status_str === "running");
 </script>
 
 <Dialog.Root
@@ -132,8 +151,8 @@
         <Dialog.Title class="flex items-center gap-2 text-lg font-bold">
           ComfyUI Workflow
           <span class="font-mono text-sm font-normal text-muted-foreground">{capture.prompt_id}</span>
-          <span class="rounded px-1.5 py-0.5 text-xs {comfyStatus.completed ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' : 'bg-red-500/15 text-red-600 dark:text-red-400'}">
-            {comfyStatus.status_str || (comfyStatus.completed ? "completed" : "incomplete")}
+          <span class="rounded px-1.5 py-0.5 text-xs {comfyBadge.className}">
+            {comfyBadge.label}
           </span>
         </Dialog.Title>
       </Dialog.Header>
@@ -153,7 +172,13 @@
       <div class="min-h-0 flex-1 overflow-y-auto p-4">
         {#if tab === "outputs"}
           {#if outputs.length === 0}
-            <p class="text-sm text-muted-foreground">No output files recorded.</p>
+            <p class="text-sm text-muted-foreground">
+              {#if workflowIsLive}
+                No outputs yet — the workflow is still {comfyStatus.status_str}.
+              {:else}
+                No output files recorded.
+              {/if}
+            </p>
           {:else}
             <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
               {#each outputs as o (o.node_id + o.filename)}
@@ -206,15 +231,19 @@
         {:else if tab === "workflow"}
           <div class="space-y-3">
             <div class="flex flex-wrap gap-2">
-              <Button size="sm" variant="outline" onclick={() => downloadJson("workflow.json", workflowUIJson(capture))}>
-                Download UI workflow
-              </Button>
+              {#if capture.workflow_ui}
+                <Button size="sm" variant="outline" onclick={() => downloadJson("workflow.json", workflowUIJson(capture))}>
+                  Download UI workflow
+                </Button>
+              {/if}
               <Button size="sm" variant="outline" onclick={() => downloadJson("workflow-api.json", workflowAPIJson(capture))}>
                 Download API workflow
               </Button>
-              <Button size="sm" variant="ghost" onclick={() => copyWorkflow(workflowUIJson(capture))}>
-                {copiedWorkflow ? "Copied" : "Copy UI workflow"}
-              </Button>
+              {#if capture.workflow_ui}
+                <Button size="sm" variant="ghost" onclick={() => copyWorkflow(workflowUIJson(capture))}>
+                  {copiedWorkflow ? "Copied" : "Copy UI workflow"}
+                </Button>
+              {/if}
             </div>
             <p class="text-xs text-muted-foreground">
               The UI workflow reopens in ComfyUI's editor; the API workflow is the executable node graph.

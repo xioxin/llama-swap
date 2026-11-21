@@ -73,6 +73,52 @@ func (r *captureRepository) Put(ctx context.Context, entry store.CaptureEntry) e
 	return nil
 }
 
+// Replace writes entry under its ID, deleting any earlier capture first. The
+// delete and insert run in one transaction so readers never observe a gap, and
+// the new row takes the newest rowid so an actively updated capture is not the
+// first one pruned. The in-memory totals are adjusted inside the write lock.
+func (r *captureRepository) Replace(ctx context.Context, entry store.CaptureEntry) error {
+	if entry.Timestamp.IsZero() {
+		entry.Timestamp = time.Now()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("replace capture: %w", err)
+	}
+	defer tx.Rollback()
+
+	// The row may not exist yet (first write); its old size is 0 then.
+	var oldCompressed, oldUncompressed int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT compressed_bytes, uncompressed_bytes FROM captures WHERE id = ?`,
+		entry.ID,
+	).Scan(&oldCompressed, &oldUncompressed)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("replace capture: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM captures WHERE id = ?`, entry.ID); err != nil {
+		return fmt.Errorf("replace capture: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO captures (id, ts_created, compressed_bytes, uncompressed_bytes, data)
+		VALUES (?, ?, ?, ?, ?)`,
+		entry.ID, entry.Timestamp.Unix(), len(entry.Data), entry.UncompressedBytes, entry.Data,
+	); err != nil {
+		return fmt.Errorf("replace capture: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("replace capture: %w", err)
+	}
+
+	r.total.Compressed += int64(len(entry.Data)) - oldCompressed
+	r.total.Uncompressed += entry.UncompressedBytes - oldUncompressed
+	return nil
+}
+
 func (r *captureRepository) Get(ctx context.Context, id string) (store.CaptureEntry, bool, error) {
 	var (
 		ts           int64

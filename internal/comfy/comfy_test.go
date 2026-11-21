@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -447,5 +448,86 @@ func TestComfy_PromptIDFromQueueItem(t *testing.T) {
 		if got := promptIDFromQueueItem(json.RawMessage(raw)); got != want {
 			t.Errorf("promptIDFromQueueItem(%s) = %q, want %q", raw, got, want)
 		}
+	}
+}
+
+// TestComfy_PromptState_RunningTuple proves a live queue item exposes the
+// submitted workflow (API graph + extra_data) alongside the running state.
+func TestComfy_PromptState_RunningTuple(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.setQueueJSON(`{"queue_running":[[1,"abc",{"44":{"inputs":{"unet_name":"m.safetensors"},"class_type":"UNETLoader"}},{"extra_pnginfo":{"workflow":{"nodes":[]}}},[]]],"queue_pending":[]}`)
+
+	status, live, err := f.client().PromptState(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("PromptState: %v", err)
+	}
+	if status != StatusRunning {
+		t.Errorf("status = %q, want running", status)
+	}
+	if live == nil || len(live.Prompt) == 0 {
+		t.Fatalf("live = %+v, want the prompt graph", live)
+	}
+	if !strings.Contains(string(live.Prompt), "UNETLoader") {
+		t.Errorf("prompt = %s, want the API graph", live.Prompt)
+	}
+	if len(live.ExtraData) == 0 {
+		t.Error("extra_data missing, want the workflow payload")
+	}
+}
+
+// TestComfy_PromptState_PendingTuple covers the queued (not started) case.
+func TestComfy_PromptState_PendingTuple(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.setQueueJSON(`{"queue_running":[],"queue_pending":[[2,"abc",{"1":{"inputs":{},"class_type":"KSampler"}},{}, []]]}`)
+
+	status, live, err := f.client().PromptState(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("PromptState: %v", err)
+	}
+	if status != StatusQueued {
+		t.Errorf("status = %q, want queued", status)
+	}
+	if live == nil || len(live.Prompt) == 0 {
+		t.Errorf("live = %+v, want the prompt graph", live)
+	}
+}
+
+// TestComfy_PromptState_HistoryFallback proves a prompt that left the queue is
+// classified from history with no live data.
+func TestComfy_PromptState_HistoryFallback(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.setHistJSON(`{"abc":{"status":{"completed":true,"status_str":"success","messages":[]}}}`)
+
+	status, live, err := f.client().PromptState(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("PromptState: %v", err)
+	}
+	if status != StatusCompleted {
+		t.Errorf("status = %q, want completed", status)
+	}
+	if live != nil {
+		t.Errorf("live = %+v, want nil for a terminal prompt", live)
+	}
+}
+
+// TestComfy_PromptState_ObjectQueueItem proves the object-form queue item still
+// reports its state; only the workflow payload is unavailable in that form.
+func TestComfy_PromptState_ObjectQueueItem(t *testing.T) {
+	f := newFakeComfy()
+	defer f.close()
+	f.setQueueJSON(`{"queue_running":[{"prompt_id":"abc"}],"queue_pending":[]}`)
+
+	status, live, err := f.client().PromptState(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("PromptState: %v", err)
+	}
+	if status != StatusRunning {
+		t.Errorf("status = %q, want running", status)
+	}
+	if live != nil {
+		t.Errorf("live = %+v, want nil for an object-form queue item", live)
 	}
 }

@@ -42,6 +42,13 @@ type CaptureRepository interface {
 	// the current time.
 	Put(ctx context.Context, entry CaptureEntry) error
 
+	// Replace stores entry, overwriting any capture already stored under the
+	// same ID and keeping the size totals accurate. It never returns
+	// ErrCaptureExists. Captures that evolve over time (ComfyUI workflow
+	// snapshots) use Replace so one task keeps exactly one stored capture. A
+	// zero Timestamp is replaced with the current time.
+	Replace(ctx context.Context, entry CaptureEntry) error
+
 	// Get returns the capture stored under id. found is false when none
 	// exists.
 	Get(ctx context.Context, id string) (entry CaptureEntry, found bool, err error)

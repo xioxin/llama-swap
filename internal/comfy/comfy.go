@@ -282,19 +282,44 @@ func promptIDFromQueueItem(raw json.RawMessage) string {
 	return ""
 }
 
-// queuedPromptIDs returns the prompt ids in ComfyUI's running and pending
-// queues, in that order.
-func (c *Client) queuedPromptIDs(ctx context.Context) (running, pending []string, err error) {
+// livePromptFromQueueItem extracts the submitted workflow from one /queue
+// element. ComfyUI sends tuples [number, prompt_id, prompt, extra_data,
+// outputs_to_execute]; sensitive extra_data keys have already been removed by
+// the server. It returns nil for the object form or when no graph is present.
+func livePromptFromQueueItem(raw json.RawMessage) *LivePrompt {
+	var tuple []json.RawMessage
+	if err := json.Unmarshal(raw, &tuple); err != nil || len(tuple) < 4 {
+		return nil
+	}
+	if len(tuple[2]) == 0 || string(tuple[2]) == "null" {
+		return nil
+	}
+	return &LivePrompt{Prompt: tuple[2], ExtraData: tuple[3]}
+}
+
+// queueItems returns the raw elements of ComfyUI's running and pending queues,
+// in that order.
+func (c *Client) queueItems(ctx context.Context) (running, pending []json.RawMessage, err error) {
 	var q comfyQueue
 	if err := c.getJSON(ctx, "/queue", &q); err != nil {
 		return nil, nil, err
 	}
-	for _, item := range q.QueueRunning {
+	return q.QueueRunning, q.QueuePending, nil
+}
+
+// queuedPromptIDs returns the prompt ids in ComfyUI's running and pending
+// queues, in that order.
+func (c *Client) queuedPromptIDs(ctx context.Context) (running, pending []string, err error) {
+	runItems, pendItems, err := c.queueItems(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, item := range runItems {
 		if id := promptIDFromQueueItem(item); id != "" {
 			running = append(running, id)
 		}
 	}
-	for _, item := range q.QueuePending {
+	for _, item := range pendItems {
 		if id := promptIDFromQueueItem(item); id != "" {
 			pending = append(pending, id)
 		}
@@ -302,24 +327,34 @@ func (c *Client) queuedPromptIDs(ctx context.Context) (running, pending []string
 	return running, pending, nil
 }
 
-// JobState reports the current state of a prompt by id. It first checks the
-// running/pending queue and then history. A prompt in neither place is
-// StatusUnknown. Terminal history states map to completed/failed/cancelled.
-func (c *Client) JobState(ctx context.Context, promptID string) (JobStatus, error) {
+// LivePrompt is the workflow data ComfyUI exposes for a prompt that is still in
+// its queue. Prompt is the executable API graph and ExtraData may hold the
+// editor graph under extra_pnginfo.workflow.
+type LivePrompt struct {
+	Prompt    json.RawMessage
+	ExtraData json.RawMessage
+}
+
+// PromptState reports the current state of a prompt by id and, while it is
+// still queued or running, the submitted workflow so an in-progress capture can
+// show it. It first checks the running/pending queue and then history. A prompt
+// in neither place is StatusUnknown. Terminal history states map to
+// completed/failed/cancelled.
+func (c *Client) PromptState(ctx context.Context, promptID string) (JobStatus, *LivePrompt, error) {
 	if promptID == "" {
-		return StatusUnknown, fmt.Errorf("comfy: empty prompt id")
+		return StatusUnknown, nil, fmt.Errorf("comfy: empty prompt id")
 	}
 
 	// Still queued or executing?
-	if running, pending, err := c.queuedPromptIDs(ctx); err == nil {
-		for _, id := range running {
-			if id == promptID {
-				return StatusRunning, nil
+	if running, pending, err := c.queueItems(ctx); err == nil {
+		for _, item := range running {
+			if promptIDFromQueueItem(item) == promptID {
+				return StatusRunning, livePromptFromQueueItem(item), nil
 			}
 		}
-		for _, id := range pending {
-			if id == promptID {
-				return StatusQueued, nil
+		for _, item := range pending {
+			if promptIDFromQueueItem(item) == promptID {
+				return StatusQueued, livePromptFromQueueItem(item), nil
 			}
 		}
 	}
@@ -334,13 +369,20 @@ func (c *Client) JobState(ctx context.Context, promptID string) (JobStatus, erro
 		} `json:"status"`
 	}
 	if err := c.getJSON(ctx, "/history/"+promptID, &hist); err != nil {
-		return StatusUnknown, err
+		return StatusUnknown, nil, err
 	}
 	entry, ok := hist[promptID]
 	if !ok {
-		return StatusUnknown, nil
+		return StatusUnknown, nil, nil
 	}
-	return classifyHistory(entry.Status.Completed, entry.Status.StatusStr, entry.Status.Messages), nil
+	return classifyHistory(entry.Status.Completed, entry.Status.StatusStr, entry.Status.Messages), nil, nil
+}
+
+// JobState reports the current state of a prompt by id. See PromptState when
+// the submitted workflow is needed as well.
+func (c *Client) JobState(ctx context.Context, promptID string) (JobStatus, error) {
+	status, _, err := c.PromptState(ctx, promptID)
+	return status, err
 }
 
 // Job is one live ComfyUI prompt still queued or executing.

@@ -71,7 +71,7 @@ func TestServer_ComfyJobs_LiveAndTerminal(t *testing.T) {
 func TestServer_ComfyJobs_LiveTupleJob(t *testing.T) {
 	fc := newFakeComfyUpstream(comfy.StatusRunning)
 	defer fc.close()
-	fc.liveQueue = `{"queue_running":[[1,"live-run",{}, {}, []]],"queue_pending":[[2,"live-pend",{}, {}, []]]}`
+	fc.setLiveQueue(`{"queue_running":[[1,"live-run",{}, {}, []]],"queue_pending":[[2,"live-pend",{}, {}, []]]}`)
 
 	cfg := config.Config{
 		Models: map[string]config.ModelConfig{

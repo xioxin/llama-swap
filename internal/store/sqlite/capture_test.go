@@ -59,6 +59,32 @@ func TestStore_CapturePutRejectsDuplicateID(t *testing.T) {
 	assert.Equal(t, []byte("first"), got.Data, "the earlier capture is kept")
 }
 
+// TestStore_CaptureReplace proves a replace overwrites the same ID and the
+// size totals reflect only the newest version, so repeatedly updated captures
+// never grow the store.
+func TestStore_CaptureReplace(t *testing.T) {
+	ctx := context.Background()
+	_, captures := newCaptureStore(t)
+
+	require.NoError(t, captures.Replace(ctx, store.CaptureEntry{ID: "a", Data: []byte("first"), UncompressedBytes: 50}))
+	assert.Equal(t, store.CaptureSize{Compressed: 5, Uncompressed: 50}, captures.Size())
+
+	require.NoError(t, captures.Replace(ctx, store.CaptureEntry{ID: "a", Data: []byte("second!"), UncompressedBytes: 70}))
+	assert.Equal(t, store.CaptureSize{Compressed: 7, Uncompressed: 70}, captures.Size(), "the old version must not count")
+
+	got, found, err := captures.Get(ctx, "a")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, []byte("second!"), got.Data)
+
+	// Replacing a missing ID behaves like an insert.
+	require.NoError(t, captures.Replace(ctx, store.CaptureEntry{ID: "b", Data: []byte("x"), UncompressedBytes: 10}))
+	assert.Equal(t, store.CaptureSize{Compressed: 8, Uncompressed: 80}, captures.Size())
+	_, found, err = captures.Get(ctx, "b")
+	require.NoError(t, err)
+	assert.True(t, found)
+}
+
 func TestStore_CaptureHas(t *testing.T) {
 	ctx := context.Background()
 	_, captures := newCaptureStore(t)
