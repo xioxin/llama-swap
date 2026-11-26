@@ -23,6 +23,8 @@
     return u ? apiUrl(u) : u;
   }
   let copiedWorkflow = $state(false);
+  // Key of the text output whose Copy button was just pressed.
+  let copiedTextKey = $state<string | null>(null);
 
   type Tab = "outputs" | "workflow" | "details";
   let tab: Tab = $state("outputs");
@@ -79,6 +81,15 @@
     setTimeout(() => (copiedWorkflow = false), 1500);
   }
 
+  // copyOutputText copies one text output (a preview/text node's result). It
+  // uses the dialog element for the non-secure-context fallback, like
+  // copyWorkflow.
+  async function copyOutputText(o: ComfyOutput, key: string) {
+    if (!(await copyText(o.text ?? "", contentEl))) return;
+    copiedTextKey = key;
+    setTimeout(() => (copiedTextKey = null), 1500);
+  }
+
   function previewable(o: ComfyOutput): boolean {
     return o.kind === "image" || o.kind === "video";
   }
@@ -114,7 +125,26 @@
   // .length or iterates over null.
   let outputs = $derived(capture?.outputs ?? []);
   let nodeList = $derived(capture?.nodes ?? []);
+  let nodeByID = $derived(new Map(nodeList.map((n) => [n.node_id, n])));
   let comfyStatus = $derived(capture?.status ?? { status_str: "", completed: false, started_at_ms: 0, finished_at_ms: 0, duration_ms: 0, cached_nodes: 0 });
+
+  // Text results are stored in the capture, so they have no filename and no
+  // proxy URL; every other output is a file.
+  function isTextOutput(o: ComfyOutput): boolean {
+    return !o.filename && o.kind === "text";
+  }
+
+  // outputKey is unique per output: files are unique per node+filename, text
+  // results per position in the (server-sorted, stable) list.
+  function outputKey(o: ComfyOutput, i: number): string {
+    return o.filename ? `${o.node_id}/${o.filename}` : `${o.node_id}/text/${i}`;
+  }
+
+  // nodeLabel names the node that produced an output for the text card header.
+  function nodeLabel(o: ComfyOutput): string {
+    const n = nodeByID.get(o.node_id);
+    return n?.title || n?.class_type || `node ${o.node_id}`;
+  }
 
   // A capture is written as soon as the workflow is queued and updated in
   // place, so its status can be a live queue state rather than history's
@@ -176,55 +206,73 @@
               {#if workflowIsLive}
                 No outputs yet — the workflow is still {comfyStatus.status_str}.
               {:else}
-                No output files recorded.
+                No outputs recorded.
               {/if}
             </p>
           {:else}
             <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {#each outputs as o (o.node_id + o.filename)}
-                <div class="rounded-md border border-border overflow-hidden">
-                  <div class="flex items-center justify-center bg-muted/30 aspect-video">
-                    {#if !previewable(o)}
-                      <!-- Unknown type: download only. -->
-                      <div class="p-4 text-center">
-                        <div class="text-2xl">📄</div>
-                        <div class="mt-1 text-xs text-muted-foreground">{o.kind || "file"}</div>
+              {#each outputs as o, i (outputKey(o, i))}
+                {#if isTextOutput(o)}
+                  <!-- Text results live in the capture: render them inline. -->
+                  <div class="rounded-md border border-border overflow-hidden sm:col-span-2 lg:col-span-3">
+                    <div class="flex items-center justify-between gap-2 border-b border-border px-2 py-1.5">
+                      <div class="min-w-0 truncate text-xs text-muted-foreground" title={nodeLabel(o)}>
+                        {nodeLabel(o)} · node {o.node_id} · {(o.text ?? "").length.toLocaleString()} chars
                       </div>
-                    {:else if !previewLoaded[o.filename]}
-                      <div class="p-4 text-center">
-                        <div class="text-2xl">{isVideo(o) ? "🎬" : "🖼️"}</div>
-                        <div class="mt-1 text-xs text-muted-foreground">preview not loaded</div>
-                        <Button size="sm" variant="outline" class="mt-2" onclick={() => (previewLoaded[o.filename] = true)}>
-                          Load preview
-                        </Button>
-                      </div>
-                    {:else if isImage(o)}
-                      <img src={mediaUrl(o.url)} alt={o.filename} class="max-h-full w-full object-contain" loading="lazy" />
-                    {:else}
-                      <video src={mediaUrl(o.url)} controls class="max-h-full w-full">
-                        <track kind="captions" />
-                      </video>
-                    {/if}
+                      <button
+                        class="inline-flex shrink-0 items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted"
+                        onclick={() => copyOutputText(o, outputKey(o, i))}
+                      >
+                        {copiedTextKey === outputKey(o, i) ? "Copied" : "Copy"}
+                      </button>
+                    </div>
+                    <pre class="max-h-60 overflow-auto whitespace-pre-wrap break-words p-2 font-mono text-xs">{o.text}</pre>
                   </div>
-                  <div class="space-y-1 p-2">
-                    <div class="truncate font-mono text-xs" title={o.filename}>{o.filename}</div>
-                    {#if mediaInfo(o)}
-                      <div class="text-xs text-muted-foreground">{mediaInfo(o)}</div>
-                    {/if}
-                    <div class="flex flex-wrap gap-1 pt-1">
-                      {#if o.download_url}
-                        <a href={mediaUrl(o.download_url)} class="inline-flex items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted" download>
-                          Download
-                        </a>
-                      {/if}
-                      {#if previewable(o) && !previewLoaded[o.filename]}
-                        <button class="inline-flex items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted" onclick={() => (previewLoaded[o.filename] = true)}>
-                          Preview
-                        </button>
+                {:else}
+                  <div class="rounded-md border border-border overflow-hidden">
+                    <div class="flex items-center justify-center bg-muted/30 aspect-video">
+                      {#if !previewable(o)}
+                        <!-- Unknown type: download only. -->
+                        <div class="p-4 text-center">
+                          <div class="text-2xl">📄</div>
+                          <div class="mt-1 text-xs text-muted-foreground">{o.kind || "file"}</div>
+                        </div>
+                      {:else if !previewLoaded[o.filename]}
+                        <div class="p-4 text-center">
+                          <div class="text-2xl">{isVideo(o) ? "🎬" : "🖼️"}</div>
+                          <div class="mt-1 text-xs text-muted-foreground">preview not loaded</div>
+                          <Button size="sm" variant="outline" class="mt-2" onclick={() => (previewLoaded[o.filename] = true)}>
+                            Load preview
+                          </Button>
+                        </div>
+                      {:else if isImage(o)}
+                        <img src={mediaUrl(o.url)} alt={o.filename} class="max-h-full w-full object-contain" loading="lazy" />
+                      {:else}
+                        <video src={mediaUrl(o.url)} controls class="max-h-full w-full">
+                          <track kind="captions" />
+                        </video>
                       {/if}
                     </div>
+                    <div class="space-y-1 p-2">
+                      <div class="truncate font-mono text-xs" title={o.filename}>{o.filename}</div>
+                      {#if mediaInfo(o)}
+                        <div class="text-xs text-muted-foreground">{mediaInfo(o)}</div>
+                      {/if}
+                      <div class="flex flex-wrap gap-1 pt-1">
+                        {#if o.download_url}
+                          <a href={mediaUrl(o.download_url)} class="inline-flex items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted" download>
+                            Download
+                          </a>
+                        {/if}
+                        {#if previewable(o) && !previewLoaded[o.filename]}
+                          <button class="inline-flex items-center rounded border border-border px-2 py-0.5 text-xs hover:bg-muted" onclick={() => (previewLoaded[o.filename] = true)}>
+                            Preview
+                          </button>
+                        {/if}
+                      </div>
+                    </div>
                   </div>
-                </div>
+                {/if}
               {/each}
             </div>
           {/if}

@@ -147,6 +147,8 @@ export interface ComfyOutput {
   duration?: number;
   fps?: number;
   frame_count?: number;
+  /** Text result (PreviewAny, ShowText, ...); filename and url are empty then. */
+  text?: string;
   url?: string;
   download_url?: string;
 }

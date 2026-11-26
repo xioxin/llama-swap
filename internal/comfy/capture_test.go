@@ -138,7 +138,11 @@ func TestComfy_ParseHistory_MultiOutputVideos(t *testing.T) {
 }
 
 func TestComfy_SetProxyURLs(t *testing.T) {
-	cap := &Capture{Outputs: []Output{{Filename: "a.png", Type: "output"}, {Filename: "b.mp4", Subfolder: "s", Type: "output"}}}
+	cap := &Capture{Outputs: []Output{
+		{Filename: "a.png", Type: "output"},
+		{Filename: "b.mp4", Subfolder: "s", Type: "output"},
+		{NodeID: "3", Kind: "text", Text: "hi"},
+	}}
 	cap.SetProxyURLs("/api/comfy/view")
 
 	if got := cap.Outputs[0].URL; got != "/api/comfy/view?filename=a.png&type=output" {
@@ -149,6 +153,10 @@ func TestComfy_SetProxyURLs(t *testing.T) {
 	}
 	if got := cap.Outputs[1].URL; got != "/api/comfy/view?filename=b.mp4&subfolder=s&type=output" {
 		t.Errorf("subfolder url = %q", got)
+	}
+	// Text results live in the capture and are never streamed from ComfyUI.
+	if cap.Outputs[2].URL != "" || cap.Outputs[2].DownloadURL != "" {
+		t.Errorf("text output got proxy URLs: %+v", cap.Outputs[2])
 	}
 }
 
@@ -310,9 +318,10 @@ func TestComfy_ParseHistory_NoFileOutputs(t *testing.T) {
 	}
 }
 
-// TestComfy_ParseHistory_SkipsNonFileItems proves text/primitive/malformed
-// output items are ignored individually instead of failing the record.
-func TestComfy_ParseHistory_SkipsNonFileItems(t *testing.T) {
+// TestComfy_ParseHistory_KeepsTextSkipsJunk proves a text result is kept as an
+// output while text/primitive/malformed items that cannot be rendered are
+// ignored individually instead of failing the record.
+func TestComfy_ParseHistory_KeepsTextSkipsJunk(t *testing.T) {
 	fixture := `{
 	  "x": {
 	    "prompt": [0, "x", {}, {}, []],
@@ -329,12 +338,156 @@ func TestComfy_ParseHistory_SkipsNonFileItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseHistory: %v", err)
 	}
-	if len(cap.Outputs) != 2 {
-		t.Fatalf("outputs = %+v, want a.png and b.png", cap.Outputs)
+	if len(cap.Outputs) != 3 {
+		t.Fatalf("outputs = %+v, want a.png, b.png and the hello text", cap.Outputs)
 	}
+	// Files keep their historical filename order and come before text results.
 	names := []string{cap.Outputs[0].Filename, cap.Outputs[1].Filename}
 	if names[0] != "a.png" || names[1] != "b.png" {
 		t.Errorf("filenames = %v", names)
+	}
+	text := cap.Outputs[2]
+	if text.NodeID != "1" || text.Kind != "text" || text.Text != "hello" {
+		t.Errorf("text output = %+v", text)
+	}
+}
+
+// historyFixtureTextOutput is a trimmed but structurally faithful record from a
+// PreviewAny node: its result lives in the per-node outputs map under "text",
+// alongside (not nested in) the file entries SaveImage-style nodes produce.
+const historyFixtureTextOutput = `{
+  "6ef4575c-b6a8-430b-a219-7adab908e08d": {
+    "prompt": [
+      2,
+      "6ef4575c-b6a8-430b-a219-7adab908e08d",
+      {
+        "5": {"inputs": {"image": ["7", 0]}, "class_type": "Booru Tagger", "_meta": {"title": "Booru Tagger"}},
+        "6": {"inputs": {"source": ["5", 0]}, "class_type": "PreviewAny", "_meta": {"title": "PreviewAny"}},
+        "7": {"inputs": {"image": "Qwen_image_2.1_00006.png"}, "class_type": "LoadImage", "_meta": {"title": "Load Image"}}
+      },
+      {"comfy_usage_source": "comfyui-frontend", "extra_pnginfo": {"workflow": {"nodes": []}}},
+      ["6"]
+    ],
+    "outputs": {
+      "6": {"text": ["street fighter, shin sangoku musou, original, chun-li, hair bun, chinese clothes, 2girls, multiple girls, double bun, black hair, fighting stance, dress, fighting, china dress, pantyhose, kicking, pants, martial arts, smile, battle, fire, shoes, white shirt, purple hair, brown eyes, green dress, red shoes, red eyes, magic, red pants, black pantyhose, short hair, shirt, red ribbon, long sleeves, breasts, ribbon, tangzhuang, flying kick, "]}
+    },
+    "status": {
+      "status_str": "success",
+      "completed": true,
+      "messages": [
+        ["execution_start", {"prompt_id": "6ef4575c-b6a8-430b-a219-7adab908e08d", "timestamp": 1795680808712}],
+        ["execution_success", {"prompt_id": "6ef4575c-b6a8-430b-a219-7adab908e08d", "timestamp": 1795680811791}]
+      ]
+    }
+  }
+}`
+
+// TestComfy_ParseHistory_TextOutput keeps a PreviewAny-style text result in the
+// capture (it used to be dropped, leaving the Outputs tab empty) and gives it no
+// proxy URL: the text is stored in the capture, not streamed from ComfyUI.
+func TestComfy_ParseHistory_TextOutput(t *testing.T) {
+	const wantText = "street fighter, shin sangoku musou, original, chun-li, hair bun, chinese clothes, 2girls, multiple girls, double bun, black hair, fighting stance, dress, fighting, china dress, pantyhose, kicking, pants, martial arts, smile, battle, fire, shoes, white shirt, purple hair, brown eyes, green dress, red shoes, red eyes, magic, red pants, black pantyhose, short hair, shirt, red ribbon, long sleeves, breasts, ribbon, tangzhuang, flying kick, "
+
+	cap, err := ParseHistory([]byte(historyFixtureTextOutput))
+	if err != nil {
+		t.Fatalf("ParseHistory: %v", err)
+	}
+	if len(cap.Outputs) != 1 {
+		t.Fatalf("outputs = %+v, want 1 text output", cap.Outputs)
+	}
+	o := cap.Outputs[0]
+	if o.NodeID != "6" || o.Kind != "text" || o.Text != wantText {
+		t.Errorf("output = %+v, want node 6 text", o)
+	}
+	if o.Filename != "" || o.URL != "" || o.DownloadURL != "" {
+		t.Errorf("text output has file fields: %+v", o)
+	}
+	cap.SetProxyURLs("/api/comfy/view")
+	if cap.Outputs[0].URL != "" || cap.Outputs[0].DownloadURL != "" {
+		t.Errorf("text output got proxy URLs: %+v", cap.Outputs[0])
+	}
+	if len(cap.WorkflowAPI) == 0 || len(cap.WorkflowUI) == 0 {
+		t.Errorf("workflows not captured: api=%d ui=%d", len(cap.WorkflowAPI), len(cap.WorkflowUI))
+	}
+	if len(cap.Nodes) != 3 {
+		t.Errorf("nodes = %+v, want the three graph nodes", cap.Nodes)
+	}
+	if cap.Status.DurationMs != 3079 {
+		t.Errorf("DurationMs = %d, want 3079", cap.Status.DurationMs)
+	}
+}
+
+// TestComfy_ParseHistory_TextVariants covers the item shapes a text output can
+// take: several items under one key, the "string" key alias, non-string scalars
+// and values that must not become blank or structured cards.
+func TestComfy_ParseHistory_TextVariants(t *testing.T) {
+	fixture := `{
+	  "x": {
+	    "prompt": [0, "x", {}, {}, []],
+	    "outputs": {
+	      "1": {"text": ["first", "", "   "]},
+	      "2": {"string": ["second"]},
+	      "3": {"text": [42, true, null, {"a": 1}, ["nested"]]}
+	    },
+	    "status": {"status_str": "success", "completed": true, "messages": []}
+	  }
+	}`
+	cap, err := ParseHistory([]byte(fixture))
+	if err != nil {
+		t.Fatalf("ParseHistory: %v", err)
+	}
+	want := []Output{
+		{NodeID: "1", Kind: "text", Text: "first"},
+		{NodeID: "2", Kind: "text", Text: "second"},
+		{NodeID: "3", Kind: "text", Text: "42"},
+		{NodeID: "3", Kind: "text", Text: "true"},
+	}
+	if len(cap.Outputs) != len(want) {
+		t.Fatalf("outputs = %+v, want %+v", cap.Outputs, want)
+	}
+	for i, o := range cap.Outputs {
+		if o.NodeID != want[i].NodeID || o.Kind != want[i].Kind || o.Text != want[i].Text || o.Filename != "" {
+			t.Errorf("output[%d] = %+v, want %+v", i, o, want[i])
+		}
+	}
+}
+
+// TestComfy_ParseHistory_OutputOrderStable guards determinism: the history
+// outputs map is unordered, so the sort must produce the same list every time
+// (the UI keys and renders outputs in that order).
+func TestComfy_ParseHistory_OutputOrderStable(t *testing.T) {
+	const fixture = `{
+	  "x": {
+	    "prompt": [0, "x", {}, {}, []],
+	    "outputs": {
+	      "1": {"text": ["alpha"]},
+	      "2": {"images": [{"filename": "b.png", "subfolder": "s", "type": "output", "metadata": {"kind": "image"}}]},
+	      "3": {"images": [{"filename": "a.png", "subfolder": "", "type": "output", "metadata": {"kind": "image"}}]},
+	      "4": {"text": ["beta", "gamma"]},
+	      "5": {"string": ["delta"]}
+	    },
+	    "status": {"status_str": "success", "completed": true, "messages": []}
+	  }
+	}`
+	// Files by filename first (a.png, b.png), then text results in node order.
+	want := []string{"3/image/a.png/", "2/image/b.png/", "1/text//alpha", "4/text//beta", "4/text//gamma", "5/text//delta"}
+	for i := 0; i < 20; i++ {
+		cap, err := ParseHistory([]byte(fixture))
+		if err != nil {
+			t.Fatalf("ParseHistory (run %d): %v", i, err)
+		}
+		got := make([]string, 0, len(cap.Outputs))
+		for _, o := range cap.Outputs {
+			got = append(got, o.NodeID+"/"+o.Kind+"/"+o.Filename+"/"+o.Text)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("run %d outputs = %v, want %d entries", i, got, len(want))
+		}
+		for j := range want {
+			if got[j] != want[j] {
+				t.Fatalf("run %d output order = %v, want %v", i, got, want)
+			}
+		}
 	}
 }
 

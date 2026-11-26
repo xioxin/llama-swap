@@ -4,7 +4,7 @@ summary: Name a model comfyui_auto and use /comfyui/ so ComfyUI's websocket does
 category: guides
 tags: [comfyui, image, websocket, upstream, swapping, ttl, docker]
 config_keys: [comfyui.swapMode, comfyui.vramFreeFraction, comfyui.queueTimeout, comfyui.startEvicts, models.*.compat.ignoreWebsockets, models.*.concurrencyLimit, models.*.checkEndpoint, models.*.cmdStop, models.*.unloadTimeout, models.*.ttl, models.*.unlisted, upstream.ignorePaths]
-updated: 2026-11-21
+updated: 2026-11-26
 ---
 
 # ComfyUI with the /comfyui endpoint
@@ -182,10 +182,13 @@ within the tracking window is marked `unknown`.
 
 Each workflow's Capture button opens a ComfyUI capture with three tabs:
 
-- **Outputs** — every produced file. Images and videos preview inline (via
-  llama-swap's `/api/comfy/view` proxy to ComfyUI); other types (audio, text,
-  3D, unknown) offer download only. Each card shows the filename and, where
-  known, resolution, frame rate, duration and frame count.
+- **Outputs** — every produced file and text result. Images and videos preview
+  inline (via llama-swap's `/api/comfy/view` proxy to ComfyUI); other file types
+  (audio, text, 3D, unknown) offer download only. Text results from preview and
+  text nodes (`PreviewAny`, `ShowText`, tagger nodes) render inline with a copy
+  button and need no ComfyUI request: the text is stored in the capture. Each
+  file card shows the filename and, where known, resolution, frame rate,
+  duration and frame count.
 - **Workflow** — the workflow JSON in two forms: the **UI graph** (reopenable in
   ComfyUI's editor) and the **API graph** (the executable node list). Both can be
   viewed and downloaded. The API client formats (`comfy-cli`, `comfy-mcp`) do
@@ -196,8 +199,8 @@ Each workflow's Capture button opens a ComfyUI capture with three tabs:
 A capture is written as soon as the task tracker observes the workflow in
 ComfyUI's queue, before it starts running. That first snapshot contains the
 workflow graphs and node list but no outputs. The tracker updates the same
-capture in place — queued to running, then the finished status, output files,
-timing and cached-node count — so one task keeps exactly one stored capture and
+capture in place — queued to running, then the finished status, outputs, timing
+and cached-node count — so one task keeps exactly one stored capture and
 updates never make the capture store grow. Queued, running, failed, cancelled
 and completed tasks all have a viewable capture; in-progress workflows simply
 show an empty Outputs tab.
@@ -205,12 +208,12 @@ show an empty Outputs tab.
 Because the capture lives in llama-swap rather than ComfyUI, its workflow and
 nodes stay viewable after ComfyUI restarts or clears its history. Output media is
 **not** copied: it stays on ComfyUI and is streamed live through
-`/api/comfy/view`. Each task's capture counts against `captureBuffer`; raise it
-when running large batches, and set `store.path` with `store.persistCaptures` to
-keep captures across llama-swap restarts. A capture that is pruned, or a task
-submitted while captures are disabled, has no View button. Opening a capture
-does not auto-refresh; reopen the dialog to see a newer version of an
-in-progress task.
+`/api/comfy/view`; text results are copied into the capture. Each task's
+capture counts against `captureBuffer`; raise it when running large batches, and
+set `store.path` with `store.persistCaptures` to keep captures across
+llama-swap restarts. A capture that is pruned, or a task submitted while
+captures are disabled, has no View button. Opening a capture does not
+auto-refresh; reopen the dialog to see a newer version of an in-progress task.
 
 When ComfyUI is already running, previews load immediately. When it is not, each
 preview shows a placeholder with a **Load preview** button: opening the dialog

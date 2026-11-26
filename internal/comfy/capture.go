@@ -48,8 +48,11 @@ type CaptureNode struct {
 	Models    []string `json:"models,omitempty"`
 }
 
-// Output is one produced file. URL and DownloadURL are llama-swap-relative
-// proxy paths (built by the server); Kind drives preview-vs-download in the UI.
+// Output is one produced file or one text result. URL and DownloadURL are
+// llama-swap-relative proxy paths (built by the server); Kind drives
+// preview-vs-download in the UI. A text result (PreviewAny, ShowText, ...) has
+// Kind "text", carries its content in Text, and has no Filename or URL: the
+// text is stored in the capture itself, not streamed from ComfyUI.
 type Output struct {
 	NodeID     string  `json:"node_id"`
 	Filename   string  `json:"filename"`
@@ -63,17 +66,21 @@ type Output struct {
 	FPS        float64 `json:"fps,omitempty"`
 	FrameCount int     `json:"frame_count,omitempty"`
 
+	// Text is the content of a text result. The empty string means the output
+	// is a file (or has no text).
+	Text string `json:"text,omitempty"`
+
 	URL         string `json:"url,omitempty"`          // proxy path to stream the file
 	DownloadURL string `json:"download_url,omitempty"` // proxy path with attachment disposition
 }
 
 // historyRecord mirrors one entry of ComfyUI's GET /history/{id} value.
 //
-// Outputs is decoded per item because ComfyUI puts primitive node results in
-// the same map as produced files: a graph's INT/string/math nodes record
-// {"value": [n]} or {"text": ["..."]} entries alongside {"images": [...]}. The
-// item shape depends on the node, so decoding the whole map strictly into file
-// structs rejects otherwise valid records.
+// Outputs is decoded per item because ComfyUI puts primitive and text node
+// results in the same map as produced files: a graph's INT/string/math nodes
+// record {"value": [n]} entries and text nodes record {"text": ["..."]}
+// alongside {"images": [...]}. The item shape depends on the node, so decoding
+// the whole map strictly into file structs rejects otherwise valid records.
 type historyRecord struct {
 	Prompt  []json.RawMessage                       `json:"prompt"`
 	Outputs map[string]map[string][]json.RawMessage `json:"outputs"`
@@ -290,22 +297,63 @@ func sortNodes(nodes []CaptureNode) {
 }
 
 func nodeLess(a, b CaptureNode) bool {
-	ai, aerr := strconv.Atoi(a.NodeID)
-	bi, berr := strconv.Atoi(b.NodeID)
+	return nodeIDLess(a.NodeID, b.NodeID)
+}
+
+// nodeIDLess orders ComfyUI's node IDs numerically when both are numbers (the
+// common case) and lexically otherwise (e.g. video combine sub-node IDs).
+func nodeIDLess(a, b string) bool {
+	ai, aerr := strconv.Atoi(a)
+	bi, berr := strconv.Atoi(b)
 	if aerr == nil && berr == nil {
 		return ai < bi
 	}
-	return a.NodeID < b.NodeID
+	return a < b
 }
 
-// parseOutputs flattens every produced file across nodes into Output entries.
-// ComfyUI records primitive node results in the same map as files, so entries
-// that do not decode to a file (or have no filename) are skipped.
+// textOutputKeys are the node output keys whose items are text results rather
+// than files. Nodes that display text (PreviewAny, ShowText, ...) return it
+// under "text"; some custom nodes use "string".
+var textOutputKeys = map[string]bool{"text": true, "string": true}
+
+// textFromRaw returns the text of one output item: a JSON string verbatim, a
+// number or boolean as its JSON literal. ok is false for null, objects and
+// arrays and for strings that are only whitespace — none of those render
+// usefully as a text output.
+func textFromRaw(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if strings.TrimSpace(s) == "" {
+			return "", false
+		}
+		return s, true
+	}
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n.String(), true
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return strconv.FormatBool(b), true
+	}
+	return "", false
+}
+
+// parseOutputs flattens every produced file and text result across nodes into
+// Output entries. ComfyUI records primitive node results in the same map as
+// files, so entries that are neither a text result (see textOutputKeys) nor a
+// file (or have no filename) are skipped.
 func parseOutputs(outputs map[string]map[string][]json.RawMessage) []Output {
 	list := make([]Output, 0)
 	for nodeID, byKey := range outputs {
-		for _, files := range byKey {
-			for _, raw := range files {
+		for key, items := range byKey {
+			for _, raw := range items {
+				if textOutputKeys[key] {
+					if text, ok := textFromRaw(raw); ok {
+						list = append(list, Output{NodeID: nodeID, Kind: "text", Text: text})
+						continue
+					}
+				}
 				var f outputFile
 				if err := json.Unmarshal(raw, &f); err != nil || f.Filename == "" {
 					continue
@@ -340,10 +388,32 @@ func parseOutputs(outputs map[string]map[string][]json.RawMessage) []Output {
 
 func sortOutputs(list []Output) {
 	for i := 1; i < len(list); i++ {
-		for j := i; j > 0 && list[j].Filename < list[j-1].Filename; j-- {
+		for j := i; j > 0 && outputLess(list[j], list[j-1]); j-- {
 			list[j], list[j-1] = list[j-1], list[j]
 		}
 	}
+}
+
+// outputLess keeps the historical filename order for files and puts text
+// results after them in node order. The node-ID and text tiebreaks make the
+// order deterministic even though the history map it comes from is unordered.
+func outputLess(a, b Output) bool {
+	aFile, bFile := a.Filename != "", b.Filename != ""
+	if aFile != bFile {
+		return aFile
+	}
+	if aFile {
+		if a.Filename != b.Filename {
+			return a.Filename < b.Filename
+		}
+		if a.Subfolder != b.Subfolder {
+			return a.Subfolder < b.Subfolder
+		}
+	}
+	if a.NodeID != b.NodeID {
+		return nodeIDLess(a.NodeID, b.NodeID)
+	}
+	return a.Text < b.Text
 }
 
 // kindFromFilename infers a media kind when the metadata omitted it.
@@ -395,11 +465,15 @@ func ext(name string) string {
 	return strings.ToLower(name[i:])
 }
 
-// SetProxyURLs fills each Output's URL and DownloadURL with llama-swap proxy
-// paths that stream the file from ComfyUI. proxyPath is the base path of the
-// proxy endpoint (e.g. "/api/comfy/view").
+// SetProxyURLs fills each file Output's URL and DownloadURL with llama-swap
+// proxy paths that stream the file from ComfyUI. proxyPath is the base path of
+// the proxy endpoint (e.g. "/api/comfy/view"). Text results are stored in the
+// capture and have no file to stream, so their URLs stay empty.
 func (c *Capture) SetProxyURLs(proxyPath string) {
 	for i := range c.Outputs {
+		if c.Outputs[i].Filename == "" {
+			continue
+		}
 		c.Outputs[i].URL = outputProxyURL(proxyPath, c.Outputs[i], false)
 		c.Outputs[i].DownloadURL = outputProxyURL(proxyPath, c.Outputs[i], true)
 	}
