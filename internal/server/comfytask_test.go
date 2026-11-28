@@ -611,9 +611,7 @@ func TestComfyTask_LiveCaptureTracksState(t *testing.T) {
 			config.ComfyUIModelID: {Proxy: fc.srv.URL},
 		},
 	})
-	prevInterval := comfyPollInterval
-	comfyPollInterval = 10 * time.Millisecond
-	t.Cleanup(func() { comfyPollInterval = prevInterval })
+	s.comfyPollEvery = 10 * time.Millisecond
 
 	graph := `{"47":{"inputs":{},"class_type":"SaveImage","_meta":{"title":"Save"}}}`
 	extra := `{"extra_pnginfo":{"workflow":{"nodes":[]}}}`
@@ -673,9 +671,7 @@ func TestComfyTask_CancelledBeforeStartKeepsCapture(t *testing.T) {
 			config.ComfyUIModelID: {Proxy: fc.srv.URL},
 		},
 	})
-	prevInterval := comfyPollInterval
-	comfyPollInterval = 10 * time.Millisecond
-	t.Cleanup(func() { comfyPollInterval = prevInterval })
+	s.comfyPollEvery = 10 * time.Millisecond
 
 	graph := `{"47":{"inputs":{},"class_type":"SaveImage","_meta":{"title":"Save"}}}`
 	fc.setLiveQueue(`{"queue_running":[],"queue_pending":[[1,"gone1",` + graph + `,{},[]]]}`)

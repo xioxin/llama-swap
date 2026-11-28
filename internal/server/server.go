@@ -105,6 +105,12 @@ type Server struct {
 	comfy   *comfy.Client
 	comfyMu sync.Mutex
 
+	// comfyPollEvery overrides the delay between ComfyUI terminal-state
+	// probes. Zero uses the two-second production default. It is per Server
+	// rather than package state so a test can shorten it without racing
+	// tracker goroutines left running by another test.
+	comfyPollEvery time.Duration
+
 	shutdownCtx    context.Context
 	shutdownFn     context.CancelFunc
 	shuttingDown   atomic.Bool

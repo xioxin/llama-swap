@@ -205,7 +205,7 @@ func (t *comfyTaskTracker) awaitTerminal(row store.ActivityLogEntry, promptID st
 		case <-ctx.Done():
 			t.finalize(row, promptID, comfy.StatusUnknown, liveCap)
 			return
-		case <-time.After(comfyPollInterval):
+		case <-time.After(t.server.comfyPollInterval()):
 		}
 	}
 }
@@ -293,9 +293,15 @@ func (s *Server) comfyTrackWindow() time.Duration {
 	return 2 * time.Hour
 }
 
-// comfyPollInterval is the delay between terminal-state probes. It is a
-// variable so tests can shorten it; production polls every two seconds.
-var comfyPollInterval = 2 * time.Second
+// comfyPollInterval returns the delay between terminal-state probes.
+// Production polls every two seconds; a test may shorten it on its own Server
+// (Server.comfyPollEvery) without touching shared package state.
+func (s *Server) comfyPollInterval() time.Duration {
+	if s.comfyPollEvery > 0 {
+		return s.comfyPollEvery
+	}
+	return 2 * time.Second
+}
 
 // comfyClient returns the router-independent ComfyUI client used for task
 // tracking, built from the comfyui_auto model's proxy. It is nil when the model
